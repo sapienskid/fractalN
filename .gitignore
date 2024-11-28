@@ -26,6 +26,9 @@ wheels/
 # IDE
 .vscode/
 .idea/
+venv/
+.vscode-upload.json
+
 
 # OS
 .DS_Store
