@@ -6,5 +6,4 @@ scikit-learn
 matplotlib
 scipy
 pandas
-
-scikit-learn
+opencv-python
