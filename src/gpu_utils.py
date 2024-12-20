@@ -74,11 +74,20 @@ def check_cudnn_installation():
             cudnn_version = cp.cuda.cudnn.getVersion()
             print(f"cuDNN Version: {cudnn_version}")
             
-            # Test cuDNN functionality
+            # Test cuDNN functionality with simpler test
             try:
-                x = cp.zeros((1, 1, 3, 3), dtype=cp.float32)
-                desc = cp.cuda.cudnn.create_tensor_descriptor(x)
-                cp.cuda.cudnn.destroy_tensor_descriptor(desc)
+                # Create a test tensor
+                x = cp.random.random((1, 1, 3, 3)).astype(cp.float32)
+                
+                # Test basic cuDNN operation (convolution)
+                w = cp.random.random((1, 1, 2, 2)).astype(cp.float32)
+                y = cp.cuda.cudnn.convolution_forward(
+                    x, w,
+                    pad=((0, 0), (0, 0)),
+                    stride=(1, 1),
+                    dilation=(1, 1),
+                    groups=1
+                )
                 print("cuDNN is working properly")
                 return True
             except Exception as e:
