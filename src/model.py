@@ -202,6 +202,7 @@ class CNN:
             }
 
     def forward(self, x, training=False):
+        """Main forward pass with error handling"""
         try:
             x = to_gpu(x)
             
@@ -209,28 +210,58 @@ class CNN:
             if len(x.shape) != 4:
                 raise ValueError(f"Expected 4D input (batch, channels, height, width), got shape {x.shape}")
             
-            # Process input
-            if self.gpu_config and self.gpu_config['is_high_memory']:
-                out = self._forward_parallel(x, training)
+            # Choose appropriate forward implementation
+            if self.gpu_config and self.gpu_config.get('is_high_memory', False):
+                return self._forward_parallel(x, training)
             elif self.use_gpu:
-                out = self._forward_in_chunks(x, training)
+                return self._forward_in_chunks(x, training)
             else:
-                out = self._forward_single_chunk(x, training)
-            
-            # Validate output
-            if out is None:
-                raise ValueError("Forward pass produced None output")
-                
-            return out
+                return self._forward_single_chunk(x, training)
             
         except Exception as e:
             print(f"Error in forward pass: {str(e)}")
             raise
 
+    def _forward_parallel(self, x, training=False):
+        """Parallel forward pass for high memory GPUs"""
+        try:
+            out = x
+            for layer in self.layers:
+                if isinstance(layer, (Dropout, BatchNormLayer)):
+                    out = layer.forward(out, training)
+                else:
+                    out = layer.forward(out)
+                
+                # Clear intermediate results to save memory
+                if GPU_AVAILABLE and isinstance(layer, ConvLayer):
+                    clear_gpu_memory(100)
+                    
+            return out
+            
+        except Exception as e:
+            print(f"Error in parallel forward pass: {e}")
+            # Fallback to regular forward pass
+            return self._forward_single_chunk(x, training)
+
+    def _forward_in_chunks(self, x, training=False):
+        """Process input in chunks to save memory"""
+        chunk_size = self.batch_size
+        outputs = []
+        
+        for i in range(0, len(x), chunk_size):
+            chunk = x[i:i + chunk_size]
+            out = self._forward_single_chunk(chunk, training)
+            outputs.append(to_cpu(out))  # Store on CPU
+            
+            if GPU_AVAILABLE:
+                clear_gpu_memory(100)
+                
+        return to_gpu(np.concatenate(outputs))
+
     def _forward_single_chunk(self, x, training=False):
         """Process a single chunk of data"""
         out = x
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             try:
                 if isinstance(layer, (Dropout, BatchNormLayer)):
                     out = layer.forward(out, training)
@@ -238,34 +269,13 @@ class CNN:
                     out = layer.forward(out)
                     
                 if out is None:
-                    raise ValueError(f"Layer {i} ({layer.__class__.__name__}) produced None output")
+                    raise ValueError(f"Layer {layer.__class__.__name__} produced None output")
                     
             except Exception as e:
-                print(f"Error in layer {i} ({layer.__class__.__name__}): {str(e)}")
+                print(f"Error in layer {layer.__class__.__name__}: {str(e)}")
                 raise
                 
         return out
-
-    def _forward_in_chunks(self, x, training=False):
-        """Memory-efficient forward pass with parallel processing"""
-        if self.enable_parallel and self.use_gpu:
-            return self._forward_parallel(x, training)
-        outputs = []
-        chunk_size = min(self.batch_size, 4)  # Use smaller chunks
-        
-        for i in range(0, len(x), chunk_size):
-            if GPU_AVAILABLE:
-                clear_gpu_memory(100)  # More aggressive cleanup
-            
-            chunk = x[i:i + chunk_size]
-            out = self._forward_single_chunk(chunk, training)
-            outputs.append(to_cpu(out))  # Store on CPU to save GPU memory
-            
-        return to_gpu(np.concatenate(outputs))
-    
-    def _forward_cpu(self, x, training=False):
-        """CPU fallback forward pass"""
-        return self._forward_single_chunk(x, training)
 
     def train_step(self, x, y):
         try:

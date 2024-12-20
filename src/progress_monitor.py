@@ -8,6 +8,7 @@ from collections import deque
 import shutil
 import time
 from gpu_utils import GPU_AVAILABLE
+from datetime import datetime
 
 init(autoreset=True)
 
@@ -46,7 +47,14 @@ class LiveDisplay:
         self.total_epochs = total_epochs
         self.start_time = time.time()
         self.last_update = 0
-        self.update_interval = 0.1  # Update every 100ms
+        self.update_interval = 0.1
+        self.show_logo()
+    
+    def show_logo(self):
+        """Display the initial logo"""
+        self.clear_screen()
+        print(AsciiArt.LOGO)
+        sys.stdout.flush()
         
     def clear_screen(self):
         sys.stdout.write("\033[2J\033[H")
@@ -105,6 +113,44 @@ class LiveDisplay:
         
         return f"{Fore.CYAN}Layer {current}/{total} [{gradient}] {Fore.YELLOW}{name}{Style.RESET_ALL}"
     
+    def print_system_info(self):
+        """Print system information in a fancy box"""
+        cpu_percent = psutil.cpu_percent()
+        cpu_count = psutil.cpu_count()
+        memory = psutil.virtual_memory()
+        
+        print(f"\n{Fore.CYAN}╔══════════════ System Information ══════════════╗")
+        print(f"║ CPU Usage      : {cpu_percent:>24.1f}% ║")
+        print(f"║ CPU Cores      : {cpu_count:>24d} ║")
+        print(f"║ RAM Total      : {memory.total/1e9:>23.1f}GB ║")
+        print(f"║ RAM Used       : {memory.used/1e9:>23.1f}GB ║")
+        print(f"║ RAM Available  : {memory.available/1e9:>23.1f}GB ║")
+        print(f"║ RAM Usage      : {memory.percent:>23.1f}% ║")
+        
+        if GPU_AVAILABLE:
+            try:
+                gpu = GPUtil.getGPUs()[0]
+                print(f"║────────────────────────────────────────────────║")
+                print(f"║ GPU Model      : {gpu.name:>24s} ║")
+                print(f"║ GPU Memory     : {gpu.memoryUsed:>8.1f}MB / {gpu.memoryTotal:>8.1f}MB ║")
+                print(f"║ GPU Usage      : {gpu.load*100:>23.1f}% ║")
+                print(f"║ GPU Memory %   : {gpu.memoryUtil*100:>23.1f}% ║")
+                print(f"║ Temperature    : {gpu.temperature:>23.1f}°C ║")
+            except Exception:
+                pass
+        print(f"╚════════════════════════════════════════════════╝\n{Style.RESET_ALL}")
+
+    def print_training_header(self, batch_size, epochs, learning_rate):
+        """Print training session information"""
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        print(f"\n{Fore.CYAN}╔══════════════ Training Session Started ══════════════╗")
+        print(f"║ Batch Size     : {batch_size:>33d} ║")
+        print(f"║ Epochs         : {epochs:>33d} ║")
+        print(f"║ Learning Rate  : {learning_rate:>33.6f} ║")
+        print(f"║ Start Time     : {current_time:>33s} ║")
+        print(f"╚════════════════════════════════════════════════════╝\n{Style.RESET_ALL}")
+
     def update_display(self, epoch, batch, total_batches, metrics, layer_info=None):
         current_time = time.time()
         if current_time - self.last_update < self.update_interval:
@@ -113,7 +159,7 @@ class LiveDisplay:
         self.last_update = current_time
         self.clear_screen()
         
-        # Print logo
+        # Always show logo first
         print(AsciiArt.LOGO)
         
         # Print epoch progress

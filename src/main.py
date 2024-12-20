@@ -6,7 +6,7 @@ except ImportError:
     cp = None
     GPU_AVAILABLE = False
 
-from data_loader import DataLoader  # Updated import
+from data_loader import DataLoader
 import cv2
 from model import CNN
 from datetime import datetime
@@ -15,11 +15,19 @@ from PIL import Image
 import psutil
 import GPUtil
 from gpu_utils import configure_gpu, clear_gpu_memory, to_gpu, to_cpu, GPU_AVAILABLE, get_gpu_info
-from progress_monitor import EnhancedProgressMonitor, EnhancedBatchProgress, print_gpu_status
+from progress_monitor import (
+    EnhancedProgressMonitor, 
+    EnhancedBatchProgress, 
+    print_gpu_status, 
+    LiveDisplay,  # Add this import
+    AsciiArt,    # Add this import
+)
 from colorama import Fore, Style, init
 from logger import TrainingLogger
 from optimizers import Adam, RMSprop, LearningRateScheduler, AdaptiveMomentum, AdaptiveLearningRate
 from exceptions import ValidationError, ShapeError, GPUError, MemoryError, GPUMemoryTracker
+import time
+
 init(autoreset=True)
 
 class ValidationContext:
@@ -96,37 +104,47 @@ def train():
     adaptive_lr = AdaptiveLearningRate(initial_lr=initial_lr)
     
     try:
+        # Initialize display first
+        display = LiveDisplay(total_epochs=epochs)
+        
+        # Clear screen and show logo first
+        display.clear_screen()
+        print(AsciiArt.LOGO)
+        
+        # Show initial setup information
+        display.print_training_header(batch_size, epochs, initial_lr)
+        display.print_system_info()
+        
+        # Print training setup
+        print(AsciiArt.PARAMS_BOX.format(batch_size, epochs, initial_lr))
+        
+        # Add a small delay to ensure the logo is visible
+        time.sleep(1)
+        
         # Initialize data loader with validation
         data_loader = DataLoader('data/processed_mushroom_dataset', batch_size=batch_size)
         
         # Get data splits
         train_indices, val_indices, test_indices = data_loader.split_indices()
         
-        # Initialize model with optimizers
+        # Initialize model and display
         model = CNN(optimizer='adam', lr=initial_lr)
-        monitor = EnhancedProgressMonitor(total_epochs=epochs)
-        model.monitor = monitor
         
-        # Initialize batch tracking
-        monitor.current_batch = 0
-        monitor.total_batches = len(train_indices) // batch_size
+        print(f"Total training batches: {len(train_indices) // batch_size}")
+        print(f"Total validation batches: {len(val_indices) // batch_size}\n")
         
-        # Log training start
-        logger.log_training_start(batch_size, epochs, initial_lr)
-        
-        # Training loop with memory tracking and adaptive components
-        best_accuracy = 0
-        patience_counter = 0
-        
-        print_gpu_status(get_gpu_info())  # Add this line
+        best_metrics = {
+            'train_loss': float('inf'),
+            'train_acc': 0,
+            'val_loss': float('inf'),
+            'val_acc': 0
+        }
         
         for epoch in range(epochs):
             with GPUMemoryTracker(threshold_mb=1000) as memory_tracker:
                 # Update learning rate using scheduler
                 current_lr = lr_scheduler.cosine_decay(epoch, epochs)
                 optimizer.learning_rate = current_lr
-                
-                monitor.print_epoch_header(epoch + 1)
                 
                 # Training phase with gradient accumulation
                 train_progress = EnhancedBatchProgress(
@@ -138,11 +156,32 @@ def train():
                 train_metrics = []
                 batch_counter = 0
                 
-                for batch_images, batch_labels in data_loader.get_batches():
+                for batch_idx, (batch_images, batch_labels) in enumerate(data_loader.get_batches()):
                     try:
                         # Memory-efficient training step
                         loss, predictions = model.train_step(batch_images, batch_labels)
                         accuracy = calculate_accuracy(predictions, batch_labels)
+                        
+                        # Update display with current progress
+                        current_metrics = {
+                            'train_loss': {'current': loss, 'best': best_metrics['train_loss'], 'average': np.mean([m['loss'] for m in train_metrics])},
+                            'train_acc': {'current': accuracy, 'best': best_metrics['train_acc'], 'average': np.mean([m['accuracy'] for m in train_metrics])}
+                        }
+                        
+                        layer_info = {
+                            'name': 'Training',
+                            'index': batch_idx + 1,
+                            'total': len(train_indices) // batch_size,
+                            'progress': (batch_idx + 1) / (len(train_indices) // batch_size)
+                        }
+                        
+                        display.update_display(
+                            epoch=epoch + 1,
+                            batch=batch_idx + 1,
+                            total_batches=len(train_indices) // batch_size,
+                            metrics=current_metrics,
+                            layer_info=layer_info
+                        )
                         
                         batch_counter += 1
                         train_progress.update(
@@ -230,11 +269,33 @@ def train():
                 
                 # Log epoch results
                 logger.log_epoch_progress(epoch + 1, epochs, epoch_metrics)
-                monitor.print_metrics(epoch_metrics)
+                
+                # Update the display with the current metrics instead
+                display.update_display(
+                    epoch=epoch + 1,
+                    batch=batch_counter,
+                    total_batches=len(train_indices) // batch_size,
+                    metrics={
+                        'train_loss': {'current': epoch_metrics['train_loss'], 'best': best_metrics['train_loss'], 'average': np.mean([m['loss'] for m in train_metrics])},
+                        'train_acc': {'current': epoch_metrics['train_acc'], 'best': best_metrics['train_acc'], 'average': np.mean([m['accuracy'] for m in train_metrics])},
+                        'val_loss': {'current': epoch_metrics['val_loss'], 'best': best_metrics['val_loss'], 'average': np.mean([m['loss'] for m in val_metrics])},
+                        'val_acc': {'current': epoch_metrics['val_acc'], 'best': best_metrics['val_acc'], 'average': np.mean([m['accuracy'] for m in val_metrics])}
+                    }
+                )
                 
                 # Log memory usage
                 memory_usage = get_memory_usage()
                 logger.log(f"Memory usage - RAM: {memory_usage['RAM']}, GPU: {memory_usage['GPU']}")
+                
+                # Update best metrics
+                if epoch_metrics['train_loss'] < best_metrics['train_loss']:
+                    best_metrics['train_loss'] = epoch_metrics['train_loss']
+                if epoch_metrics['train_acc'] > best_metrics['train_acc']:
+                    best_metrics['train_acc'] = epoch_metrics['train_acc']
+                if epoch_metrics['val_loss'] < best_metrics['val_loss']:
+                    best_metrics['val_loss'] = epoch_metrics['val_loss']
+                if epoch_metrics['val_acc'] > best_metrics['val_acc']:
+                    best_metrics['val_acc'] = epoch_metrics['val_acc']
                 
     except Exception as e:
         logger.log(f"Training failed: {str(e)}")

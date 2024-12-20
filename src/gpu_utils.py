@@ -70,36 +70,49 @@ def check_cudnn_installation():
         cuda_version = cp.cuda.runtime.runtimeGetVersion()
         print(f"CUDA Version: {cuda_version}")
         
-        # Check cuDNN
-        if hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available:
-            cudnn_version = cp.cuda.cudnn.getVersion()
-            print(f"cuDNN Version: {cudnn_version}")
-            return True
-        else:
-            # Detailed error checking
-            if not hasattr(cp.cuda, 'cudnn'):
-                print("cuDNN module not found in CuPy")
-            elif not cp.cuda.cudnn.available:
-                print("cuDNN is installed but not available")
-                
-            # Check library path
-            import os
-            library_paths = os.environ.get('LD_LIBRARY_PATH', '').split(':')
-            cudnn_found = False
-            for path in library_paths:
-                if os.path.exists(os.path.join(path, 'libcudnn.so')):
-                    cudnn_found = True
-                    print(f"Found cuDNN in: {path}")
-            if not cudnn_found:
-                print("libcudnn.so not found in LD_LIBRARY_PATH")
-                
-            return False
+        # More detailed cuDNN check
+        cudnn_available = False
+        try:
+            if hasattr(cp.cuda, 'cudnn'):
+                cudnn = cp.cuda.cudnn
+                if cudnn.available:
+                    cudnn_version = cudnn.getVersion()
+                    print(f"cuDNN Version: {cudnn_version}")
+                    cudnn_available = True
+                else:
+                    print("cuDNN is installed but not properly linked")
+        except Exception as e:
+            print(f"Error checking cuDNN: {e}")
+
+        # Check library paths
+        import os
+        library_paths = os.environ.get('LD_LIBRARY_PATH', '').split(':')
+        cudnn_paths = []
+        for path in library_paths:
+            if os.path.exists(os.path.join(path, 'libcudnn.so')):
+                cudnn_paths.append(path)
+        
+        if cudnn_paths:
+            print("Found cuDNN in:", ', '.join(cudnn_paths))
             
-    except ImportError as e:
-        print(f"Error importing CuPy/cuDNN: {e}")
-        return False
+            # Try to explicitly load cuDNN
+            if not cudnn_available:
+                try:
+                    from ctypes import cdll
+                    for path in cudnn_paths:
+                        try:
+                            cdll.LoadLibrary(os.path.join(path, 'libcudnn.so'))
+                            cudnn_available = True
+                            break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    print(f"Failed to load cuDNN: {e}")
+
+        return cudnn_available
+
     except Exception as e:
-        print(f"Error checking cuDNN: {e}")
+        print(f"Error in CUDA/cuDNN check: {e}")
         return False
 
 def configure_gpu():
@@ -112,37 +125,34 @@ def configure_gpu():
         print("\nChecking CUDA and cuDNN installation:")
         cudnn_available = check_cudnn_installation()
         
-        gpu_config = get_gpu_config()
-        if gpu_config is None:
-            return False, None
-
+        # Get GPU configuration
         device = cp.cuda.Device(0)
+        total_mem_gb = device.mem_info[1] / (1024**3)
         
+        # More conservative memory settings
+        is_high_memory = total_mem_gb >= 8  # Lowered threshold
+        optimal_batch_size = 32 if total_mem_gb >= 8 else 4
+        pool_size = int(0.7 * total_mem_gb * 1024**3)  # Use 70% of memory
+        
+        gpu_config = {
+            'is_high_memory': is_high_memory,
+            'total_memory': total_mem_gb,
+            'optimal_batch_size': optimal_batch_size,
+            'pool_size': pool_size,
+            'enable_parallel': is_high_memory,
+            'cudnn_available': cudnn_available
+        }
+
         # Configure memory pool
         cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
         
-        # Configure cuDNN
-        if cudnn_available:
-            try:
-                # Try to initialize cuDNN
-                cp.cuda.cudnn.get_handle()
-                gpu_config['cudnn_available'] = True
-                gpu_config['cudnn_version'] = cp.cuda.cudnn.getVersion()
-            except Exception as e:
-                print(f"Warning: cuDNN initialization failed: {e}")
-                gpu_config['cudnn_available'] = False
-        else:
-            gpu_config['cudnn_available'] = False
-        
-        device.use()
-        
         print(f"\nGPU Configuration:")
-        print(f"Total Memory: {gpu_config['total_memory']:.1f}GB")
-        print(f"Mode: {'High Memory' if gpu_config['is_high_memory'] else 'Low Memory'}")
-        print(f"Optimal Batch Size: {gpu_config['optimal_batch_size']}")
-        print(f"cuDNN Available: {gpu_config['cudnn_available']}")
-        if gpu_config['cudnn_available']:
-            print(f"cuDNN Version: {gpu_config['cudnn_version']}")
+        print(f"Total Memory: {total_mem_gb:.1f}GB")
+        print(f"Mode: {'High Memory' if is_high_memory else 'Low Memory'}")
+        print(f"Optimal Batch Size: {optimal_batch_size}")
+        print(f"cuDNN Available: {cudnn_available}")
+        if cudnn_available:
+            print(f"cuDNN Version: {cp.cuda.cudnn.getVersion()}")
         
         return True, gpu_config
 
