@@ -254,6 +254,7 @@ class ConvLayer:
                     print(f"cuDNN forward failed: {e}, falling back to direct")
             
             # Use direct convolution instead of cuDNN
+            self.inputs = inputs
             return self._forward_direct(inputs)
             
         except Exception as e:
