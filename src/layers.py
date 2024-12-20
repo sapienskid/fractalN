@@ -104,6 +104,7 @@ class ConvLayer:
         self.initialized = False
         self.use_fft = True  # Enable FFT-based convolution for large inputs
         self.min_fft_size = 32  # Minimum size for using FFT
+        self.memory_cleanup_counter = 0
     
     def _initialize_params(self, input_shape):
         """Initialize filters based on input shape"""
@@ -130,30 +131,75 @@ class ConvLayer:
         
         if not self.initialized:
             self._initialize_params(inputs.shape)
-        
-        # Use FFT for large inputs
-        if self.use_fft and min(self.height, self.width) >= self.min_fft_size:
-            return self._forward_fft(inputs)
-        return self._forward_direct(inputs)
+            
+        # Validate input shape
+        if len(inputs.shape) != 4:
+            raise ValueError(f"Expected 4D input tensor, got shape {inputs.shape}")
+            
+        # Choose convolution method
+        try:
+            if self.use_fft and min(self.height, self.width) >= self.min_fft_size:
+                return self._forward_fft(inputs)
+            return self._forward_direct(inputs)
+        except Exception as e:
+            print(f"Forward pass failed: {e}")
+            raise e
     
     def _forward_fft(self, inputs):
-        """FFT-based convolution for better performance on GPU"""
+        """FFT-based convolution with proper shape handling"""
         xp = self.xp
         batch_size, in_channels, height, width = inputs.shape
         
+        # Calculate padding
+        pad_h = self.filter_size - 1
+        pad_w = self.filter_size - 1
+        
         # Pad input for FFT
-        padded_inputs = xp.pad(inputs, ((0,0), (0,0), (0,self.filter_size-1), (0,self.filter_size-1)))
+        padded_inputs = xp.pad(
+            inputs, 
+            ((0,0), (0,0), (0,pad_h), (0,pad_w)),
+            mode='constant'
+        )
         
-        # Prepare for batch FFT
-        fft_inputs = xp.fft.rfft2(padded_inputs)
-        fft_filters = xp.fft.rfft2(self.filters, s=padded_inputs.shape[2:])
+        # Calculate output dimensions
+        out_height = height - self.filter_size + 1
+        out_width = width - self.filter_size + 1
+        output = xp.zeros((batch_size, self.num_filters, out_height, out_width), dtype=inputs.dtype)
         
-        # Perform convolution in frequency domain
-        output = xp.zeros((batch_size, self.num_filters, height, width), dtype=inputs.dtype)
-        for i in range(batch_size):
-            for j in range(self.num_filters):
-                result = xp.fft.irfft2(fft_inputs[i] * fft_filters[j])
-                output[i,j] = result[:height,:width]
+        try:
+            # Prepare for batch FFT
+            fft_inputs = xp.fft.rfft2(padded_inputs)
+            fft_filters = xp.fft.rfft2(self.filters, s=padded_inputs.shape[2:])
+            
+            # Perform convolution in frequency domain
+            for i in range(batch_size):
+                for j in range(self.num_filters):
+                    # Ensure shapes match for multiplication
+                    result = xp.fft.irfft2(
+                        fft_inputs[i] * fft_filters[j],
+                        s=padded_inputs.shape[2:]
+                    )
+                    # Extract valid region
+                    output[i,j] = result[:out_height, :out_width]
+            
+            return output
+            
+        except Exception as e:
+            print(f"FFT convolution failed: {e}")
+            # Fallback to direct convolution
+            return self._forward_direct(inputs)
+
+    def _forward_direct(self, inputs):
+        """Direct convolution as fallback"""
+        output_height = self.height - self.filter_size + 1
+        output_width = self.width - self.filter_size + 1
+        output = self.xp.zeros((self.batch_size, self.num_filters, output_height, output_width))
+        
+        for i in range(output_height):
+            for j in range(output_width):
+                input_slice = inputs[:, :, i:i+self.filter_size, j:j+self.filter_size]
+                for k in range(self.num_filters):
+                    output[:, k, i, j] = self.xp.sum(input_slice * self.filters[k], axis=(1,2,3))
         
         return output
 

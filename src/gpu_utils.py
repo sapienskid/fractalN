@@ -44,13 +44,11 @@ def configure_gpu():
         device = cp.cuda.Device(0)
         device.use()
         
-        # Set compute mode to maximize throughput
-        cp.cuda.runtime.setDeviceFlags(cp.cuda.runtime.deviceScheduleAuto)
-        
         # Print GPU configuration
         mem_info = device.mem_info
         print(f"\nGPU Memory Configuration:")
         print(f"Total: {mem_info[1]/1024**3:.1f}GB")
+        print(f"Free: {mem_info[0]/1024**3:.1f}GB")
         print(f"Pool Size: {pool_size/1024**3:.1f}GB")
         return True
 
