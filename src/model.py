@@ -127,12 +127,21 @@ class CNN:
         self.lr_decay = 0.95
         self.epoch_count = 0
         self.train_mode = True
-        self.batch_size = 8
+        self.batch_size = 32  # Increased batch size for GPU
         self.memory_cleanup_counter = 0
+        self.enable_gpu_optimizations = True
+        
+        # Optimize memory usage
+        self.memory_threshold = 1000  # MB
+        self.cleanup_frequency = 5  # Cleanup every 5 batches
 
     def forward(self, x, training=False):
         try:
             x = to_gpu(x)
+            if self.enable_gpu_optimizations:
+                # Process in smaller chunks if needed
+                if x.shape[0] > self.batch_size:
+                    return self._forward_in_chunks(x, training)
             
             out = x
             total_layers = len(self.layers)
@@ -158,11 +167,25 @@ class CNN:
             
             out = to_cpu(out)
             predictions = softmax(out)
+            
+            if self.memory_cleanup_counter % self.cleanup_frequency == 0:
+                clear_gpu_memory(self.memory_threshold)
+            
             return to_cpu(predictions)
             
         except Exception as e:
             print(f"\nError in forward pass: {str(e)}")
             raise e
+
+    def _forward_in_chunks(self, x, training=False):
+        """Process large batches in chunks"""
+        outputs = []
+        chunk_size = self.batch_size
+        for i in range(0, len(x), chunk_size):
+            chunk = x[i:i + chunk_size]
+            out = self._forward_single_chunk(chunk, training)
+            outputs.append(to_cpu(out))
+        return to_gpu(np.concatenate(outputs))
 
     def train_step(self, x, y):
         try:

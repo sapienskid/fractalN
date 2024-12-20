@@ -38,3 +38,8 @@ Thumbs.db
 *.hdf5
 *.npy
 *.npz
+
+# Google Colab
+.ipynb_checkpoints/
+*.pyc
+__pycache__/

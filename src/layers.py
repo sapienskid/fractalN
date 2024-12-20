@@ -102,6 +102,8 @@ class ConvLayer:
         self.learning_rate = 0.01
         self.v = None
         self.initialized = False
+        self.use_fft = True  # Enable FFT-based convolution for large inputs
+        self.min_fft_size = 32  # Minimum size for using FFT
     
     def _initialize_params(self, input_shape):
         """Initialize filters based on input shape"""
@@ -126,25 +128,35 @@ class ConvLayer:
         inputs = to_gpu(inputs)
         self.inputs = inputs
         
-        # Initialize parameters if first forward pass
         if not self.initialized:
             self._initialize_params(inputs.shape)
-            
-        output_height = self.height - self.filter_size + 1
-        output_width = self.width - self.filter_size + 1
-        output = to_gpu(np.zeros((self.batch_size, self.num_filters, output_height, output_width)))
         
-        for i in range(output_height):
-            for j in range(output_width):
-                input_slice = inputs[:, :, i:i+self.filter_size, j:j+self.filter_size]
-                for k in range(self.num_filters):
-                    if GPU_AVAILABLE:
-                        output[:, k, i, j] = cp.sum(input_slice * self.filters[k], axis=(1,2,3))
-                    else:
-                        output[:, k, i, j] = np.sum(input_slice * self.filters[k], axis=(1,2,3))
+        # Use FFT for large inputs
+        if self.use_fft and min(self.height, self.width) >= self.min_fft_size:
+            return self._forward_fft(inputs)
+        return self._forward_direct(inputs)
+    
+    def _forward_fft(self, inputs):
+        """FFT-based convolution for better performance on GPU"""
+        xp = self.xp
+        batch_size, in_channels, height, width = inputs.shape
+        
+        # Pad input for FFT
+        padded_inputs = xp.pad(inputs, ((0,0), (0,0), (0,self.filter_size-1), (0,self.filter_size-1)))
+        
+        # Prepare for batch FFT
+        fft_inputs = xp.fft.rfft2(padded_inputs)
+        fft_filters = xp.fft.rfft2(self.filters, s=padded_inputs.shape[2:])
+        
+        # Perform convolution in frequency domain
+        output = xp.zeros((batch_size, self.num_filters, height, width), dtype=inputs.dtype)
+        for i in range(batch_size):
+            for j in range(self.num_filters):
+                result = xp.fft.irfft2(fft_inputs[i] * fft_filters[j])
+                output[i,j] = result[:height,:width]
         
         return output
-    
+
     def backward(self, dout):
         dout = to_gpu(dout)
         dx = self.xp.zeros_like(self.inputs)
@@ -161,6 +173,10 @@ class ConvLayer:
         # Update with momentum
         self.v = self.momentum * self.v - self.learning_rate * dw
         self.filters += self.v
+        
+        # Add GPU memory cleanup
+        if self.use_gpu and self.memory_cleanup_counter % 10 == 0:
+            cp.get_default_memory_pool().free_all_blocks()
         
         return dx
 

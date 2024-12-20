@@ -30,28 +30,32 @@ def get_gpu_info():
         return None
 
 def configure_gpu():
-    """Configure CuPy GPU settings"""
+    """Configure GPU for optimal performance in Colab"""
     if not GPU_AVAILABLE:
-        print(f"{Fore.YELLOW}No GPU available. Running on CPU{Style.RESET_ALL}")
         return False
 
     try:
-        cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
+        # Set larger memory pool for Colab's 15GB GPU
+        pool_size = 12 * 1024 * 1024 * 1024  # 12GB pool
+        cp.cuda.set_allocator(cp.cuda.MemoryPool(cp.cuda.malloc_managed).malloc)
+        cp.cuda.set_pinned_memory_allocator(cp.cuda.PinnedMemoryPool().malloc)
+        
+        # Enable unified memory access
         device = cp.cuda.Device(0)
         device.use()
         
-        gpu_info = get_gpu_info()
-        if gpu_info:
-            print(f"\n{Fore.GREEN}GPU Configuration:")
-            print(f"├── Device: {gpu_info['name']}")
-            print(f"├── Compute Capability: {gpu_info['compute_capability']}")
-            print(f"├── Total Memory: {gpu_info['total_memory'] / (1024**2):.1f} MB")
-            print(f"└── CUDA Version: {gpu_info['cuda_version']}{Style.RESET_ALL}")
-            return True
-        return False
+        # Set compute mode to maximize throughput
+        cp.cuda.runtime.setDeviceFlags(cp.cuda.runtime.deviceScheduleAuto)
         
+        # Print GPU configuration
+        mem_info = device.mem_info
+        print(f"\nGPU Memory Configuration:")
+        print(f"Total: {mem_info[1]/1024**3:.1f}GB")
+        print(f"Pool Size: {pool_size/1024**3:.1f}GB")
+        return True
+
     except Exception as e:
-        print(f"{Fore.RED}Error configuring GPU: {e}{Style.RESET_ALL}")
+        print(f"Error configuring GPU: {e}")
         return False
 
 def to_gpu(x):
@@ -66,7 +70,10 @@ def to_cpu(x):
         return cp.asnumpy(x)
     return x
 
-def clear_gpu_memory():
-    """Clear GPU memory cache"""
+def clear_gpu_memory(threshold_mb=1000):
+    """Smart GPU memory cleanup"""
     if GPU_AVAILABLE:
-        cp.get_default_memory_pool().free_all_blocks()
+        pool = cp.get_default_memory_pool()
+        used_mb = pool.used_bytes() / (1024 * 1024)
+        if used_mb > threshold_mb:
+            pool.free_all_blocks()
