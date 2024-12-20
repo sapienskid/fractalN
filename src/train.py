@@ -148,17 +148,34 @@ def train_model():
     inputs = tf.keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
     model = create_model(inputs)
     
-    # Learning rate schedule
+    # Modified learning rate and optimizer setup with proper type casting
     initial_learning_rate = 0.001
-    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-        initial_learning_rate,
-        decay_steps=1000,
-        decay_rate=0.9,
-        staircase=True
-    )
+    decay_steps = 1000
+    decay_rate = 0.9
     
-    # Compile model with learning rate schedule
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+        def __init__(self, initial_learning_rate, decay_steps, decay_rate):
+            self.initial_learning_rate = float(initial_learning_rate)
+            self.decay_steps = int(decay_steps)
+            self.decay_rate = float(decay_rate)
+        
+        def __call__(self, step):
+            step_float = tf.cast(step, tf.float32)
+            decay_steps_float = tf.cast(self.decay_steps, tf.float32)
+            decay_factor = tf.pow(self.decay_rate, tf.floor(step_float / decay_steps_float))
+            return self.initial_learning_rate * decay_factor
+
+        def get_config(self):
+            return {
+                "initial_learning_rate": self.initial_learning_rate,
+                "decay_steps": self.decay_steps,
+                "decay_rate": self.decay_rate
+            }
+    
+    # Create optimizer with fixed learning rate first
+    optimizer = tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
+    
+    # Compile model
     model.compile(
         optimizer=optimizer,
         loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
@@ -170,7 +187,7 @@ def train_model():
         ]
     )
 
-    # Add memory cleanup callback
+    # Add learning rate scheduler callback instead of custom schedule
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
             monitor='val_loss',
@@ -189,7 +206,6 @@ def train_model():
             save_best_only=True,
             mode='max'
         ),
-        # Add memory cleanup callback
         tf.keras.callbacks.LambdaCallback(
             on_epoch_end=lambda epoch, logs: gc.collect()
         )
