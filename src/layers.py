@@ -102,7 +102,9 @@ class ConvLayer:
         self.learning_rate = 0.01
         self.v = None
         self.initialized = False
-        self.use_fft = True  # Enable FFT-based convolution for large inputs
+        self.use_fft = True  # Enable FFT by default for 15GB GPU
+        self.parallel_channels = True  # Enable parallel channel processing
+        self.chunk_size = 32  # Larger chunks for more memory
         self.min_fft_size = 32  # Minimum size for using FFT
         self.memory_cleanup_counter = 0
     
@@ -138,8 +140,12 @@ class ConvLayer:
             
         # Choose convolution method
         try:
-            if self.use_fft and min(self.height, self.width) >= self.min_fft_size:
-                return self._forward_fft(inputs)
+            if self.use_gpu and hasattr(cp, 'cuda') and cp.cuda.get_device_id() is not None:
+                mem_info = cp.cuda.Device().mem_info
+                total_gb = mem_info[1] / (1024**3)
+                
+                if total_gb >= 12:  # High memory GPU
+                    return self._forward_parallel(inputs)
             return self._forward_direct(inputs)
         except Exception as e:
             print(f"Forward pass failed: {e}")
@@ -223,6 +229,39 @@ class ConvLayer:
         
         return output
 
+    def _forward_chunked(self, inputs):
+        """Process large batches in memory-efficient chunks"""
+        outputs = []
+        for i in range(0, inputs.shape[0], self.chunk_size):
+            chunk = inputs[i:i + self.chunk_size]
+            out = self._forward_direct(chunk)
+            outputs.append(to_cpu(out))  # Store on CPU
+            if self.use_gpu:
+                clear_gpu_memory(100)
+        return to_gpu(np.concatenate(outputs))
+
+    def _forward_parallel(self, inputs):
+        """Optimized parallel forward pass for high memory GPUs"""
+        batch_size, in_channels, height, width = inputs.shape
+        out_height = height - self.filter_size + 1
+        out_width = width - self.filter_size + 1
+        
+        # Pre-allocate output array
+        output = self.xp.zeros((batch_size, self.num_filters, out_height, out_width))
+        
+        # Process channels in parallel using CuPy's optimized operations
+        for k in range(self.num_filters):
+            # Use vectorized operations for entire batch
+            output[:, k] = self.xp.sum([
+                self.xp.correlate2d(
+                    inputs[:, c],
+                    self.filters[k, c],
+                    mode='valid'
+                ) for c in range(in_channels)
+            ], axis=0)
+            
+        return output
+
     def backward(self, dout):
         dout = to_gpu(dout)
         dx = self.xp.zeros_like(self.inputs)
@@ -240,9 +279,10 @@ class ConvLayer:
         self.v = self.momentum * self.v - self.learning_rate * dw
         self.filters += self.v
         
-        # Add GPU memory cleanup
-        if self.use_gpu and self.memory_cleanup_counter % 10 == 0:
-            cp.get_default_memory_pool().free_all_blocks()
+        # Add memory cleanup
+        if self.use_gpu and self.memory_cleanup_counter % 2 == 0:
+            clear_gpu_memory(100)
+        self.memory_cleanup_counter += 1
         
         return dx
 

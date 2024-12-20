@@ -127,13 +127,36 @@ class CNN:
         self.lr_decay = 0.95
         self.epoch_count = 0
         self.train_mode = True
-        self.batch_size = 32  # Increased batch size for GPU
         self.memory_cleanup_counter = 0
         self.enable_gpu_optimizations = True
         
-        # Optimize memory usage
-        self.memory_threshold = 1000  # MB
-        self.cleanup_frequency = 5  # Cleanup every 5 batches
+        # Adjust batch size based on available GPU memory
+        if GPU_AVAILABLE:
+            device = cp.cuda.Device(0)
+            total_mem_gb = device.mem_info[1] / (1024**3)
+            
+            if total_mem_gb >= 12:  # High memory GPU optimizations
+                self.batch_size = 64  # Larger batch size
+                self.enable_parallel = True
+                self.memory_threshold = 2000  # Higher threshold (2GB)
+                self.cleanup_frequency = 10   # Less frequent cleanup
+                
+                # Enable performance optimizations
+                for layer in self.layers:
+                    if isinstance(layer, ConvLayer):
+                        layer.use_fft = True
+                        layer.parallel_channels = True
+                        layer.chunk_size = 32
+            else:
+                # Use smaller batch size for limited GPU memory
+                self.batch_size = 4 if total_mem_gb < 6 else 32
+                self.enable_chunk_processing = total_mem_gb < 6
+        else:
+            self.batch_size = 32
+            self.enable_chunk_processing = False
+        
+        self.memory_threshold = 500  # MB (lower threshold for 4GB GPU)
+        self.cleanup_frequency = 2    # More frequent cleanup
 
     def forward(self, x, training=False):
         try:
@@ -178,44 +201,89 @@ class CNN:
             raise e
 
     def _forward_in_chunks(self, x, training=False):
-        """Process large batches in chunks"""
+        """Memory-efficient forward pass with parallel processing"""
+        if self.enable_parallel and self.use_gpu:
+            return self._forward_parallel(x, training)
         outputs = []
-        chunk_size = self.batch_size
+        chunk_size = min(self.batch_size, 4)  # Use smaller chunks
+        
         for i in range(0, len(x), chunk_size):
+            if GPU_AVAILABLE:
+                clear_gpu_memory(100)  # More aggressive cleanup
+            
             chunk = x[i:i + chunk_size]
             out = self._forward_single_chunk(chunk, training)
-            outputs.append(to_cpu(out))
+            outputs.append(to_cpu(out))  # Store on CPU to save GPU memory
+            
         return to_gpu(np.concatenate(outputs))
+
+    def _forward_parallel(self, x, training=False):
+        """High performance forward pass for 15GB GPU"""
+        with cp.cuda.Stream():
+            outputs = []
+            chunk_size = self.batch_size
+            
+            for i in range(0, len(x), chunk_size):
+                chunk = x[i:i + chunk_size]
+                out = self._forward_single_chunk(chunk, training)
+                outputs.append(out)  # Keep on GPU
+            
+            return cp.concatenate(outputs)
 
     def train_step(self, x, y):
         try:
-            # Clear GPU memory periodically
-            if self.memory_cleanup_counter % 10 == 0:
-                clear_gpu_memory()
+            if self.enable_chunk_processing and x.shape[0] > 4:
+                return self._train_step_chunked(x, y)
+            
+            # Clear GPU memory more frequently
+            if self.memory_cleanup_counter % 2 == 0:
+                clear_gpu_memory(100)
             self.memory_cleanup_counter += 1
             
-            # Ensure inputs are on correct device
             x = to_gpu(x)
             y = to_gpu(y)
             
-            # Forward pass with proper type conversion
             predictions = self.forward(x, training=True)
-            predictions = to_gpu(predictions)  # Move back to GPU for loss calculation
+            predictions = to_gpu(predictions)
             
-            # Calculate loss and convert to CPU float
             loss = float(to_cpu(cross_entropy_loss(predictions, y)))
             
-            # Backward pass
+            # Clear intermediate results
+            if GPU_AVAILABLE:
+                clear_gpu_memory(100)
+            
             grad = cross_entropy_gradient(predictions, y)
             for layer in reversed(self.layers):
                 grad = layer.backward(grad)
+                if GPU_AVAILABLE and isinstance(layer, ConvLayer):
+                    clear_gpu_memory(100)  # Clear after each conv layer
             
-            # Return results ensuring they're on CPU
             return loss, to_cpu(predictions)
             
         except Exception as e:
             print(f"\nError in train_step: {str(e)}")
             raise e
+    
+    def _train_step_chunked(self, x, y):
+        """Memory-efficient training step"""
+        chunk_size = 4
+        total_loss = 0
+        all_predictions = []
+        
+        for i in range(0, len(x), chunk_size):
+            if GPU_AVAILABLE:
+                clear_gpu_memory(100)
+            
+            chunk_x = x[i:i + chunk_size]
+            chunk_y = y[i:i + chunk_size]
+            
+            loss, predictions = self.train_step(chunk_x, chunk_y)
+            total_loss += loss * len(chunk_x)
+            all_predictions.append(predictions)
+        
+        avg_loss = total_loss / len(x)
+        combined_predictions = np.concatenate(all_predictions)
+        return avg_loss, combined_predictions
     
     def to_device(self, x):
         if self.use_gpu and isinstance(x, np.ndarray):
