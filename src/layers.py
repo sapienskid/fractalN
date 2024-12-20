@@ -843,8 +843,8 @@ class Flatten:
     def forward(self, x):
         x = self.to_device(x)
         self.input_shape = x.shape
-        # Ensure proper flattening
-        return x.reshape(x.shape[0], -1)
+        # Ensure proper flattening of NCHW format
+        return x.reshape(x.shape[0], -1)  # Flatten all dimensions after batch
     
     def backward(self, grad):
         return grad.reshape(self.input_shape)

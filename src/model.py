@@ -144,29 +144,29 @@ class CNN:
         # Initialize learning rate scheduler
         self.lr_scheduler = LearningRateScheduler(initial_lr=lr)
         
-        # Initialize layers with padding and optimizer
+        # Initialize layers with correct shapes
         self.layers = [
-            ConvLayer(num_filters=32, filter_size=3, padding='same'),
+            ConvLayer(num_filters=32, filter_size=3, padding='same', stride=1),  # 224x224 -> 224x224
             BatchNormLayer(32),
             ReLU(),
-            MaxPoolLayer(2),
+            MaxPoolLayer(2),  # 224x224 -> 112x112
             
-            ConvLayer(num_filters=64, filter_size=3),
+            ConvLayer(num_filters=64, filter_size=3, padding='same', stride=1),  # 112x112 -> 112x112
             BatchNormLayer(64),
             ReLU(),
-            MaxPoolLayer(2),
+            MaxPoolLayer(2),  # 112x112 -> 56x56
             
-            ConvLayer(num_filters=128, filter_size=3),
+            ConvLayer(num_filters=128, filter_size=3, padding='same', stride=1),  # 56x56 -> 56x56
             BatchNormLayer(128),
             ReLU(),
-            MaxPoolLayer(2),
+            MaxPoolLayer(2),  # 56x56 -> 28x28
             
-            Flatten(),  # This is crucial for reshaping
-            FCLayer(flattened_size, 512),
+            Flatten(),  # (batch_size, 128, 28, 28) -> (batch_size, 128*28*28)
+            FCLayer(128 * 28 * 28, 512),  # Update input size to match flattened shape
             BatchNormLayer(512),
             ReLU(),
             Dropout(0.5),
-            FCLayer(512, 2)  # Output layer with 2 classes
+            FCLayer(512, 2)
         ]
         
         # Assign optimizer to layers
@@ -210,13 +210,27 @@ class CNN:
             if len(x.shape) != 4:
                 raise ValueError(f"Expected 4D input (batch, channels, height, width), got shape {x.shape}")
             
-            # Choose appropriate forward implementation
-            if self.gpu_config and self.gpu_config.get('is_high_memory', False):
-                return self._forward_parallel(x, training)
-            elif self.use_gpu:
-                return self._forward_in_chunks(x, training)
-            else:
-                return self._forward_single_chunk(x, training)
+            # Track shapes for debugging
+            current_shape = x.shape
+            for i, layer in enumerate(self.layers):
+                try:
+                    if isinstance(layer, (Dropout, BatchNormLayer)):
+                        x = layer.forward(x, training)
+                    else:
+                        x = layer.forward(x)
+                    
+                    if x is None:
+                        raise ValueError(f"Layer {i} ({layer.__class__.__name__}) produced None output")
+                    
+                    current_shape = x.shape
+                    
+                except Exception as e:
+                    print(f"Error in layer {i} ({layer.__class__.__name__})")
+                    print(f"Input shape: {current_shape}")
+                    print(f"Error: {str(e)}")
+                    raise
+            
+            return x
             
         except Exception as e:
             print(f"Error in forward pass: {str(e)}")
