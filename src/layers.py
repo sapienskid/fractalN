@@ -2,7 +2,6 @@ import numpy as np
 import cupy as cp
 import os
 from gpu_utils import GPU_AVAILABLE, to_gpu, to_cpu, clear_gpu_memory
-import cupy.cuda.cudnn as cudnn
 from exceptions import (
     ValidationError, ShapeError, GPUError, 
     LayerError, MemoryError, GPUMemoryTracker,
@@ -120,15 +119,20 @@ class ConvLayer:
         self.learning_rate = 0.01
         self.v = None
         self.initialized = False
-        self.use_fft = True  # Enable FFT by default for 15GB GPU
-        self.parallel_channels = True  # Enable parallel channel processing
-        self.chunk_size = 32  # Larger chunks for more memory
-        self.min_fft_size = 32  # Minimum size for using FFT
-        self.memory_cleanup_counter = 0
 
-        self.padding = padding  # Store the padding type
-        self.stride_int = stride  # Keep original integer stride
-        self.stride = (stride, stride)  # Tuple for operations
+        # Configure based on available GPU memory
+        if self.use_gpu:
+            try:
+                device = cp.cuda.Device(0)
+                total_mem_gb = device.mem_info[1] / (1024**3)
+                self.is_high_memory = total_mem_gb >= 12
+                self.chunk_size = 32 if total_mem_gb >= 12 else 4
+            except:
+                self.is_high_memory = False
+                self.chunk_size = 4
+
+        self.padding = padding
+        self.stride_int = stride
         
         if padding == 'same':
             self.pad_h = (filter_size - 1) // 2
@@ -137,60 +141,12 @@ class ConvLayer:
             self.pad_h = 0
             self.pad_w = 0
         self.pad = ((0, 0), (0, 0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w))
-
-        # Check GPU memory capacity
-        self.is_high_memory = False
-        if self.use_gpu:
-            try:
-                device = cp.cuda.Device(0)
-                total_mem_gb = device.mem_info[1] / (1024**3)
-                self.is_high_memory = total_mem_gb >= 12
-                
-                # Configure based on memory
-                self.use_fft = self.is_high_memory
-                self.parallel_channels = self.is_high_memory
-                self.chunk_size = 32 if self.is_high_memory else 2
-            except:
-                pass
-
-        self.use_cudnn = False  # Disable cuDNN by default
         
-        # Initialize filters with zeros to prevent None
-        self.filters = None
-        self.initialized = False
-        
-        # Add input dimensions
+        # Initialize dimensions
         self.in_channels = None
         self.input_height = None
         self.input_width = None
 
-        # Initialize cuDNN support
-        self.use_cudnn = False
-        if GPU_AVAILABLE and hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available:
-            try:
-                self.use_cudnn = True
-                # Remove the get_default_handle call as it's not needed
-                self.pad = (self.pad_h, self.pad_h, self.pad_w, self.pad_w)  # HWHW padding
-                self.stride = (self.stride, self.stride)
-                self.dilation = (1, 1)
-            except Exception as e:
-                print(f"cuDNN initialization warning: {e}")
-                self.use_cudnn = False
-
-        # Add shape validation
-        self.input_shape = None
-        self.output_shape = None
-        
-        # Add safer cuDNN initialization
-        self.use_cudnn = False
-        if GPU_AVAILABLE and hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available:
-            try:
-                self.use_cudnn = True
-                self.cudnn_handle = cp.cuda.cudnn.get_handle()
-            except Exception as e:
-                print(f"cuDNN initialization failed: {e}")
-                self.use_cudnn = False
-    
     def _initialize_params(self, input_shape):
         """Initialize filters based on input shape"""
         batch_size, in_channels, height, width = input_shape
@@ -198,7 +154,6 @@ class ConvLayer:
         self.input_height = height
         self.input_width = width
         
-        # Only initialize if not already done
         if not self.initialized:
             scale = np.sqrt(2.0 / (in_channels * self.filter_size * self.filter_size))
             self.filters = to_gpu(np.random.randn(
@@ -210,320 +165,68 @@ class ConvLayer:
             self.v = to_gpu(np.zeros_like(self.filters))
             self.initialized = True
 
-    def _init_cudnn_descriptors(self, x_shape):
-        """Initialize cuDNN descriptors"""
-        if not self.use_cudnn:
-            return
-            
-        try:
-            N, C, H, W = x_shape
-            
-            # Create tensor descriptors
-            self.x_desc = cp.cuda.cudnn.create_tensor_descriptor()
-            self.w_desc = cp.cuda.cudnn.create_filter_descriptor()
-            self.conv_desc = cp.cuda.cudnn.create_convolution_descriptor()
-            
-            # Set descriptor configurations
-            cp.cuda.cudnn.set_tensor4d_descriptor(
-                self.x_desc,
-                cp.cuda.cudnn.CUDNN_DATA_FLOAT,
-                N, C, H, W
-            )
-            
-            cp.cuda.cudnn.set_filter4d_descriptor(
-                self.w_desc,
-                cp.cuda.cudnn.CUDNN_DATA_FLOAT,
-                self.num_filters, C,
-                self.filter_size, self.filter_size
-            )
-            
-            cp.cuda.cudnn.set_convolution2d_descriptor(
-                self.conv_desc,
-                self.pad_h, self.pad_w,
-                self.stride, self.stride,
-                1, 1,  # dilation
-                cp.cuda.cudnn.CUDNN_CROSS_CORRELATION,
-                cp.cuda.cudnn.CUDNN_DATA_FLOAT
-            )
-            
-        except Exception as e:
-            print(f"Error initializing cuDNN descriptors: {e}")
-            self.use_cudnn = False
-
-    def _validate_shapes(self, x):
-        """Validate input shapes and calculate output shape"""
-        if len(x.shape) != 4:
-            raise ShapeError(f"Expected 4D input (batch, channels, height, width), got shape {x.shape}")
-        
-        batch_size, in_channels, in_height, in_width = x.shape
-        
-        if self.padding == 'valid':
-            out_height = ((in_height - self.filter_size) // self.stride_int) + 1
-            out_width = ((in_width - self.filter_size) // self.stride_int) + 1
-        else:  # same padding
-            out_height = in_height // self.stride_int
-            out_width = in_width // self.stride_int
-            
-        return (batch_size, self.num_filters, out_height, out_width)
-
     def forward(self, inputs):
+        """Forward pass using direct convolution"""
         try:
             inputs = to_gpu(inputs)
-            self.input_shape = inputs.shape
-            self.output_shape = self._validate_shapes(inputs)
-            
-            # Initialize filters if needed
             if not self.initialized:
                 self._initialize_params(inputs.shape)
             
-            if self.use_cudnn:
-                try:
-                    return self._forward_cudnn(inputs)
-                except Exception as e:
-                    print(f"cuDNN forward failed: {e}, falling back to direct")
-                    self.use_cudnn = False  # Disable cuDNN for future calls
+            if self.filters is None:
+                raise ValueError("Filters not properly initialized")
             
+            self.inputs = inputs
+            
+            # Choose between chunked or direct processing based on batch size
+            if inputs.shape[0] > self.chunk_size:
+                return self._forward_chunked(inputs)
             return self._forward_direct(inputs)
             
         except Exception as e:
-            raise LayerError(
-                f"Error in ConvLayer forward pass: {str(e)}\n"
-                f"Input shape: {self.input_shape}\n"
-                f"Expected output shape: {self.output_shape}",
-                layer_type='ConvLayer'
-            )
-
-    def _forward_cudnn(self, x):
-        """Forward pass using cuDNN with proper error handling"""
-        try:
-            # Create output tensor with proper shape
-            out = self.xp.zeros(self.output_shape, dtype=x.dtype)
-            
-            # Update descriptors
-            self._update_cudnn_descriptors(x)
-            
-            # Perform convolution
-            algo = cp.cuda.cudnn.get_convolution_forward_algorithm(
-                x, self.filters, self.conv_desc, self.cudnn_handle, 
-                deterministic=True
-            )
-            cp.cuda.cudnn.convolution_forward(
-                x, self.filters, out,
-                self.conv_desc, algo, self.cudnn_handle
-            )
-            
-            return out
-            
-        except Exception as e:
-            raise RuntimeError(f"cuDNN forward failed: {str(e)}")
+            print(f"Error in ConvLayer forward pass: {e}")
+            raise
 
     def _forward_direct(self, inputs):
-        """Direct convolution implementation with proper shape handling"""
+        """Direct convolution implementation"""
         batch_size, channels, height, width = inputs.shape
-        out_height = ((height + 2 * self.pad_h - self.filter_size) // self.stride_int) + 1
-        out_width = ((width + 2 * self.pad_w - self.filter_size) // self.stride_int) + 1
+        output_height = ((height + 2 * self.pad_h - self.filter_size) // self.stride_int) + 1
+        output_width = ((width + 2 * self.pad_w - self.filter_size) // self.stride_int) + 1
         
-        # Pre-allocate output array with correct shape
-        output = self.xp.zeros((batch_size, self.num_filters, out_height, out_width))
-        
-        # Apply padding if needed
+        # Apply padding
         if self.padding == 'same':
-            inputs = self.xp.pad(
-                inputs,
-                ((0,0), (0,0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w)),
-                mode='constant'
-            )
+            padded_inputs = self.xp.pad(inputs, self.pad, 'constant')
+        else:
+            padded_inputs = inputs
+            
+        output = self.xp.zeros((batch_size, self.num_filters, output_height, output_width))
         
-        # Perform direct convolution
-        for i in range(out_height):
-            for j in range(out_width):
+        # Optimized direct convolution
+        for i in range(output_height):
+            for j in range(output_width):
                 h_start = i * self.stride_int
                 h_end = h_start + self.filter_size
                 w_start = j * self.stride_int
                 w_end = w_start + self.filter_size
                 
-                # Get input patch and perform convolution
-                input_patch = inputs[:, :, h_start:h_end, w_start:w_end]
+                input_slice = padded_inputs[:, :, h_start:h_end, w_start:w_end]
                 for k in range(self.num_filters):
                     output[:, k, i, j] = self.xp.sum(
-                        input_patch * self.filters[k:k+1],
+                        input_slice * self.filters[k, :, :, :], 
                         axis=(1,2,3)
                     )
         
         return output
 
-    def _forward_implementation(self, inputs):
-        # Validate input shape
-        if len(inputs.shape) != 4:
-            raise ShapeError(
-                "Invalid input shape",
-                expected_shape=(None, self.in_channels, None, None),
-                actual_shape=inputs.shape
-            )
-            
-        inputs = to_gpu(inputs)
-        self.inputs = inputs
-        
-        if not self.initialized:
-            self._initialize_params(inputs.shape)
-            
-        # Validate input shape
-        if len(inputs.shape) != 4:
-            raise ValueError(f"Expected 4D input tensor, got shape {inputs.shape}")
-            
-        # Choose convolution method
-        try:
-            if self.is_high_memory and self.use_gpu:
-                return self._forward_parallel(inputs)
-            elif inputs.shape[0] > self.chunk_size and self.use_gpu:
-                return self._forward_chunked(inputs)
-            return self._forward_direct(inputs)
-        except Exception as e:
-            print(f"Forward pass failed: {e}")
-            return self._forward_direct(inputs)
-
-    def _forward_fft(self, inputs):
-        """FFT-based convolution with fixed shape handling"""
-        xp = self.xp
-        batch_size, in_channels, height, width = inputs.shape
-        
-        # Calculate padding to ensure output shape is correct
-        pad_h = self.filter_size - 1
-        pad_w = self.filter_size - 1
-        
-        # Calculate FFT size to be power of 2 for efficiency
-        fft_height = 2 ** np.ceil(np.log2(height + pad_h)).astype(int)
-        fft_width = 2 ** np.ceil(np.log2(width + pad_w)).astype(int)
-        
-        # Pad input for FFT
-        padded_inputs = xp.pad(
-            inputs, 
-            ((0,0), (0,0), 
-             (0, fft_height - height), 
-             (0, fft_width - width)),
-            mode='constant'
-        )
-        
-        # Pad filters to match FFT size
-        padded_filters = xp.pad(
-            self.filters,
-            ((0,0), (0,0),
-             (0, fft_height - self.filter_size),
-             (0, fft_width - self.filter_size)),
-            mode='constant'
-        )
-        
-        # Calculate output dimensions
-        out_height = height - self.filter_size + 1
-        out_width = width - self.filter_size + 1
-        output = xp.zeros((batch_size, self.num_filters, out_height, out_width), dtype=inputs.dtype)
-        
-        try:
-            for i in range(batch_size):
-                for c in range(in_channels):
-                    # Compute FFT of input channel
-                    fft_input = xp.fft.rfft2(padded_inputs[i, c])
-                    
-                    for f in range(self.num_filters):
-                        # Compute FFT of filter
-                        fft_filter = xp.fft.rfft2(padded_filters[f, c])
-                        
-                        # Multiply in frequency domain
-                        fft_product = fft_input * fft_filter
-                        
-                        # Inverse FFT and accumulate
-                        if c == 0:
-                            output[i, f] = xp.fft.irfft2(fft_product)[:out_height, :out_width]
-                        else:
-                            output[i, f] += xp.fft.irfft2(fft_product)[:out_height, :out_width]
-            
-            return output
-            
-        except Exception as e:
-            print(f"FFT convolution failed: {e}, falling back to direct convolution")
-            # Clear GPU memory before fallback
-            if self.use_gpu:
-                cp.get_default_memory_pool().free_all_blocks()
-            return self._forward_direct(inputs)
-
-    def _forward_chunked(self, inputs):
-        """Process large batches in memory-efficient chunks"""
-        outputs = []
-        for i in range(0, inputs.shape[0], self.chunk_size):
-            chunk = inputs[i:i + self.chunk_size]
-            out = self._forward_direct(chunk)
-            outputs.append(to_cpu(out))  # Store on CPU
-            if self.use_gpu:
-                clear_gpu_memory(100)
-        return to_gpu(np.concatenate(outputs))
-
-    def _forward_parallel(self, inputs):
-        """Optimized parallel forward pass for high memory GPUs"""
-        batch_size, in_channels, height, width = inputs.shape
-        out_height = height - self.filter_size + 1
-        out_width = width - self.filter_size + 1
-        
-        # Pre-allocate output array
-        output = self.xp.zeros((batch_size, self.num_filters, out_height, out_width))
-        
-        # Process channels in parallel using CuPy's optimized operations
-        for k in range(self.num_filters):
-            # Use vectorized operations for entire batch
-            output[:, k] = self.xp.sum([
-                self.xp.correlate2d(
-                    inputs[:, c],
-                    self.filters[k, c],
-                    mode='valid'
-                ) for c in range(in_channels)
-            ], axis=0)
-            
-        return output
-
-    def _forward_cudnn(self, inputs):
-        """Forward pass using cuDNN"""
-        try:
-            # Use raw cuDNN convolution
-            output = cp.zeros((
-                inputs.shape[0],
-                self.num_filters,
-                ((inputs.shape[2] + 2 * self.pad_h - self.filter_size) // self.stride_int) + 1,
-                ((inputs.shape[3] + 2 * self.pad_w - self.filter_size) // self.stride_int) + 1
-            ), dtype=inputs.dtype)
-            
-            cp.cuda.cudnn.convolution_forward(
-                inputs, self.filters, output,
-                pad=(self.pad_h, self.pad_w),
-                stride=self.stride,
-                dilation=(1, 1),
-                groups=1,
-                auto_tune=True
-            )
-            return output
-        except Exception as e:
-            print(f"cuDNN forward failed: {e}, falling back to direct")
-            return self._forward_direct(inputs)
-
     def backward(self, dout):
-        """Backward pass with proper shape handling"""
-        dout = to_gpu(dout)
-        
+        """Backward pass with direct computation"""
         try:
-            if self.use_cudnn:
-                try:
-                    return self._backward_cudnn(dout)
-                except Exception as e:
-                    print(f"cuDNN backward failed: {e}, falling back to direct")
-            
+            dout = to_gpu(dout)
             dx = self.xp.zeros_like(self.inputs)
             dw = self.xp.zeros_like(self.filters)
             
-            # Apply padding to input if needed
+            # Apply padding if needed
             if self.padding == 'same':
-                padded_inputs = self.xp.pad(
-                    self.inputs,
-                    self.pad,
-                    'constant'
-                )
+                padded_inputs = self.xp.pad(self.inputs, self.pad, 'constant')
             else:
                 padded_inputs = self.inputs
             
@@ -537,15 +240,12 @@ class ConvLayer:
                     w_start = j * self.stride_int
                     w_end = w_start + self.filter_size
                     
-                    # Get the current input patch
                     input_slice = padded_inputs[:, :, h_start:h_end, w_start:w_end]
                     
                     for k in range(self.num_filters):
-                        # Calculate filter gradients
                         dout_k = dout[:, k, i, j].reshape(-1, 1, 1, 1)
                         dw[k] += self.xp.sum(input_slice * dout_k, axis=0)
                         
-                        # Calculate input gradients
                         if self.padding == 'same':
                             dx_slice = dx[:, :, h_start:h_end, w_start:w_end]
                             dx_slice += self.filters[k] * dout_k
@@ -553,22 +253,12 @@ class ConvLayer:
                             dx[:, :, h_start:h_end, w_start:w_end] += \
                                 self.filters[k] * dout_k
             
-            # Gradient clipping
-            clip_threshold = 5.0
-            dw = self.xp.clip(dw, -clip_threshold, clip_threshold)
-            
-            # Update with chosen optimizer
+            # Update weights
             if hasattr(self, 'optimizer'):
                 self.filters = self.optimizer.update(self.filters, dw, f'conv_layer_{id(self)}')
             else:
-                # Default momentum update
                 self.v = self.momentum * self.v - self.learning_rate * dw
                 self.filters += self.v
-            
-            # Memory cleanup
-            if self.use_gpu and self.memory_cleanup_counter % 2 == 0:
-                clear_gpu_memory(100)
-            self.memory_cleanup_counter += 1
             
             return dx
             
@@ -576,81 +266,16 @@ class ConvLayer:
             print(f"Error in backward pass: {e}")
             raise
 
-    def _backward_direct(self, dout):
-        """Direct backward pass implementation"""
-        dx = self.xp.zeros_like(self.inputs)
-        dw = self.xp.zeros_like(self.filters)
-        
-        # Add gradient checking in debug mode
-        if hasattr(self, 'debug_mode') and self.debug_mode:
-            self._check_gradients(dout)
-        
-        # Implement gradient accumulation for large batches
-        if dout.shape[0] > self.chunk_size:
-            return self._backward_chunked(dout)
-            
-        # ... rest of backward implementation ...
-
-    def _backward_cudnn(self, dout):
-        """Backward pass using cuDNN"""
-        try:
-            dx = cp.zeros_like(self.inputs)
-            dw = cp.zeros_like(self.filters)
-            
-            # Compute gradients using raw cuDNN
-            cp.cuda.cudnn.convolution_backward_data(
-                self.filters, dout, dx,
-                pad=(self.pad_h, self.pad_w),
-                stride=self.stride,
-                dilation=(1, 1),
-                groups=1,
-                auto_tune=True
-            )
-            
-            cp.cuda.cudnn.convolution_backward_filter(
-                self.inputs, dout, dw,
-                pad=(self.pad_h, self.pad_w),
-                stride=self.stride,
-                dilation=(1, 1),
-                groups=1,
-                auto_tune=True
-            )
-            
-            return dx, dw
-        except Exception as e:
-            print(f"cuDNN backward failed: {e}, falling back to direct")
-            return self._backward_direct(dout)
-
-    def _check_gradients(self, dout):
-        """Gradient checking using finite differences"""
-        epsilon = 1e-7
-        numerical_gradients = self.xp.zeros_like(self.filters)
-        
-        # Compute numerical gradients for a subset of weights
-        for i in range(min(self.num_filters, 2)):
-            for j in range(min(self.in_channels, 2)):
-                original = self.filters[i,j,0,0].copy()
-                
-                # f(x + h)
-                self.filters[i,j,0,0] = original + epsilon
-                out_plus = self._forward_direct(self.inputs)
-                cost_plus = self.xp.sum(out_plus * dout)
-                
-                # f(x - h)
-                self.filters[i,j,0,0] = original - epsilon
-                out_minus = self._forward_direct(self.inputs)
-                cost_minus = self.xp.sum(out_minus * dout)
-                
-                # (f(x + h) - f(x - h)) / 2h
-                numerical_gradients[i,j,0,0] = (cost_plus - cost_minus) / (2 * epsilon)
-                self.filters[i,j,0,0] = original
-        
-        # Compare with analytical gradients
-        analytical_gradients = self._compute_weight_gradients(dout)
-        diff = self.xp.abs(numerical_gradients - analytical_gradients)
-        
-        if self.xp.max(diff) > 1e-5:
-            print(f"Gradient check failed! Max difference: {self.xp.max(diff)}")
+    def _forward_chunked(self, inputs):
+        """Process large batches in memory-efficient chunks"""
+        outputs = []
+        for i in range(0, inputs.shape[0], self.chunk_size):
+            chunk = inputs[i:i + self.chunk_size]
+            out = self._forward_direct(chunk)
+            outputs.append(to_cpu(out))  # Store on CPU
+            if self.use_gpu:
+                clear_gpu_memory(100)
+        return to_gpu(np.concatenate(outputs))
 
     def save_params(self, path, layer_name):
         """Save convolutional layer parameters"""
@@ -671,13 +296,8 @@ class ConvLayer:
             print(f"Error loading ConvLayer parameters: {e}")
 
     def __del__(self):
-        """Cleanup cuDNN resources"""
-        if hasattr(self, 'use_cudnn') and self.use_cudnn:
-            for desc in [self.x_desc, self.w_desc, self.y_desc, self.conv_desc]:
-                if desc is not None:
-                    cudnn.destroy_tensor_descriptor(desc)
-            if hasattr(self, 'cudnn_handle'):
-                cudnn.destroy(self.cudnn_handle)
+        """Cleanup resources"""
+        pass
 
 class MaxPoolLayer:
     def __init__(self, pool_size=2):

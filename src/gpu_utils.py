@@ -70,23 +70,24 @@ def check_cudnn_installation():
         print(f"CUDA Version: {cuda_version}")
         
         # Check cuDNN availability
-        if hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available:
+        if cp.cuda.cudnn.available:
             cudnn_version = cp.cuda.cudnn.getVersion()
             print(f"cuDNN Version: {cudnn_version}")
             
-            # Test cuDNN functionality with simpler test
+            # Test cuDNN functionality with basic convolution
             try:
-                # Create a test tensor
                 x = cp.random.random((1, 1, 3, 3)).astype(cp.float32)
-                
-                # Test basic cuDNN operation (convolution)
                 w = cp.random.random((1, 1, 2, 2)).astype(cp.float32)
-                y = cp.cuda.cudnn.convolution_forward(
-                    x, w,
-                    pad=((0, 0), (0, 0)),
+                
+                # Use raw cuDNN convolution
+                y = cp.zeros((1, 1, 2, 2), dtype=cp.float32)
+                cp.cuda.cudnn.convolution_forward(
+                    x, w, y,
+                    pad=(0, 0),
                     stride=(1, 1),
                     dilation=(1, 1),
-                    groups=1
+                    groups=1,
+                    auto_tune=True
                 )
                 print("cuDNN is working properly")
                 return True
@@ -96,7 +97,7 @@ def check_cudnn_installation():
         else:
             print("cuDNN is not available")
             return False
-            
+                
     except Exception as e:
         print(f"Error checking CUDA/cuDNN: {e}")
         return False
