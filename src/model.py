@@ -15,6 +15,7 @@ from gpu_utils import (
     configure_gpu,
     is_high_memory_gpu
 )
+from optimizers import Adam, RMSprop, LearningRateScheduler
 
 class ReLU:
     def __init__(self):
@@ -102,7 +103,7 @@ def cross_entropy_gradient(predictions, targets):
     return (predictions - targets) / predictions.shape[0]
 
 class CNN:
-    def __init__(self):
+    def __init__(self, optimizer='adam', lr=0.001):
         self.use_gpu = GPU_AVAILABLE
         self.xp = cp if self.use_gpu else np
         
@@ -134,9 +135,18 @@ class CNN:
         # Initialize memory counter
         self.memory_cleanup_counter = 0
         
-        # Initialize layers
+        # Initialize optimizer
+        if optimizer == 'adam':
+            self.optimizer = Adam(learning_rate=lr)
+        elif optimizer == 'rmsprop':
+            self.optimizer = RMSprop(learning_rate=lr)
+        
+        # Initialize learning rate scheduler
+        self.lr_scheduler = LearningRateScheduler(initial_lr=lr)
+        
+        # Initialize layers with padding and optimizer
         self.layers = [
-            ConvLayer(num_filters=32, filter_size=3),
+            ConvLayer(num_filters=32, filter_size=3, padding='same'),
             BatchNormLayer(32),
             ReLU(),
             MaxPoolLayer(2),
@@ -158,6 +168,16 @@ class CNN:
             Dropout(0.5),
             FCLayer(512, 2)  # Output layer with 2 classes
         ]
+        
+        # Assign optimizer to layers
+        for layer in self.layers:
+            if hasattr(layer, 'optimizer'):
+                layer.optimizer = self.optimizer
+
+        # Add gradient accumulation settings
+        self.grad_accumulation_steps = 4  # Accumulate gradients over 4 steps
+        self.accumulated_gradients = {}
+        self.current_accumulation_step = 0
 
     def _init_gpu_config(self):
         """Initialize GPU configuration"""
@@ -185,38 +205,45 @@ class CNN:
         try:
             x = to_gpu(x)
             
-            # Ensure input has correct shape (batch_size, channels, height, width)
+            # Input shape validation
             if len(x.shape) != 4:
-                if len(x.shape) == 3:
-                    x = x.reshape(1, *x.shape)  # Add batch dimension
-                else:
-                    raise ValueError(f"Expected 4D input, got shape {x.shape}")
+                raise ValueError(f"Expected 4D input (batch, channels, height, width), got shape {x.shape}")
             
-            # Use GPU-specific optimizations
+            # Process input
             if self.gpu_config and self.gpu_config['is_high_memory']:
-                return self._forward_parallel(x, training)
+                out = self._forward_parallel(x, training)
             elif self.use_gpu:
-                return self._forward_in_chunks(x, training) # Changed from _forward_chunked
-            return self._forward_cpu(x, training)
+                out = self._forward_in_chunks(x, training)
+            else:
+                out = self._forward_single_chunk(x, training)
+            
+            # Validate output
+            if out is None:
+                raise ValueError("Forward pass produced None output")
+                
+            return out
+            
         except Exception as e:
-            print(f"Error in forward pass: {e}")
-            raise e
+            print(f"Error in forward pass: {str(e)}")
+            raise
 
     def _forward_single_chunk(self, x, training=False):
-        """Process a single chunk of data with shape tracking"""
+        """Process a single chunk of data"""
         out = x
         for i, layer in enumerate(self.layers):
-            if isinstance(layer, (Dropout, BatchNormLayer)):
-                out = layer.forward(out, training)
-            else:
-                out = layer.forward(out)
+            try:
+                if isinstance(layer, (Dropout, BatchNormLayer)):
+                    out = layer.forward(out, training)
+                else:
+                    out = layer.forward(out)
+                    
+                if out is None:
+                    raise ValueError(f"Layer {i} ({layer.__class__.__name__}) produced None output")
+                    
+            except Exception as e:
+                print(f"Error in layer {i} ({layer.__class__.__name__}): {str(e)}")
+                raise
                 
-            # Debug shape after each layer
-            print(f"Layer {i} ({layer.__class__.__name__}) output shape: {out.shape}")
-        
-        # Ensure final output has correct shape
-        if len(out.shape) > 2:
-            out = out.reshape(out.shape[0], -1)
         return out
 
     def _forward_in_chunks(self, x, training=False):
@@ -242,6 +269,10 @@ class CNN:
 
     def train_step(self, x, y):
         try:
+            # Split batch if too large
+            if x.shape[0] > self.batch_size:
+                return self._train_step_with_accumulation(x, y)
+            
             if self.enable_chunk_processing and x.shape[0] > self.batch_size:
                 return self._train_step_chunked(x, y)
             
@@ -314,6 +345,46 @@ class CNN:
         
         avg_loss = total_loss / len(x)
         combined_predictions = np.concatenate(all_predictions)
+        return avg_loss, combined_predictions
+
+    def _train_step_with_accumulation(self, x, y):
+        """Training step with gradient accumulation"""
+        total_loss = 0
+        predictions = []
+        batch_size = len(x)
+        mini_batch_size = batch_size // self.grad_accumulation_steps
+        
+        for i in range(0, batch_size, mini_batch_size):
+            end_idx = min(i + mini_batch_size, batch_size)
+            mini_batch_x = x[i:end_idx]
+            mini_batch_y = y[i:end_idx]
+            
+            # Forward pass
+            mini_batch_pred = self.forward(mini_batch_x, training=True)
+            loss = float(to_cpu(cross_entropy_loss(mini_batch_pred, mini_batch_y)))
+            total_loss += loss * len(mini_batch_x)
+            predictions.append(to_cpu(mini_batch_pred))
+            
+            # Backward pass with scaled gradients
+            grad = cross_entropy_gradient(mini_batch_pred, mini_batch_y)
+            grad = grad / self.grad_accumulation_steps
+            
+            # Accumulate gradients
+            if i == 0:
+                self._init_gradients(grad)
+            else:
+                self._accumulate_gradients(grad)
+            
+            self.current_accumulation_step += 1
+            
+            # Update weights when accumulation is complete
+            if self.current_accumulation_step >= self.grad_accumulation_steps:
+                self._update_weights_with_accumulated_gradients()
+                self.current_accumulation_step = 0
+        
+        # Return average loss and combined predictions
+        avg_loss = total_loss / batch_size
+        combined_predictions = np.concatenate(predictions)
         return avg_loss, combined_predictions
     
     def to_device(self, x):

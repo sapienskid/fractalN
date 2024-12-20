@@ -3,6 +3,14 @@ import cupy as cp
 import os
 from gpu_utils import GPU_AVAILABLE, to_gpu, to_cpu, clear_gpu_memory
 import cupy.cuda.cudnn as cudnn
+from exceptions import (
+    ValidationError, ShapeError, GPUError, 
+    LayerError, MemoryError, GPUMemoryTracker,
+    validate_conv_params,  # Add this import
+    validate_shapes_for_matmul,  # Add this if you need matrix multiplication validation
+    check_gpu_memory,  # Add this if you need memory checks
+    validate_input  # Add this if you need input validation
+)
 
 class BatchNormLayer:
     def __init__(self, num_features):
@@ -93,7 +101,16 @@ class BatchNormLayer:
             print(f"Error loading BatchNormLayer parameters: {e}")
 
 class ConvLayer:
-    def __init__(self, num_filters, filter_size):
+    def __init__(self, num_filters, filter_size, padding='valid', stride=1):
+        # Validate parameters
+        try:
+            validate_conv_params(filter_size, stride, padding)
+        except ValidationError as e:
+            raise LayerError(
+                f"Invalid ConvLayer parameters: {str(e)}", 
+                layer_type='ConvLayer'
+            )
+            
         self.use_gpu = GPU_AVAILABLE
         self.xp = cp if self.use_gpu else np
         self.num_filters = num_filters
@@ -108,6 +125,15 @@ class ConvLayer:
         self.chunk_size = 32  # Larger chunks for more memory
         self.min_fft_size = 32  # Minimum size for using FFT
         self.memory_cleanup_counter = 0
+
+        self.padding = padding
+        self.stride = stride
+        self.pad_h = 0
+        self.pad_w = 0
+        
+        if padding == 'same':
+            self.pad_h = (filter_size - 1) // 2
+            self.pad_w = (filter_size - 1) // 2
 
         # Check GPU memory capacity
         self.is_high_memory = False
@@ -138,23 +164,32 @@ class ConvLayer:
             except Exception as e:
                 print(f"cuDNN initialization warning: {e}")
                 self.use_cudnn = False
+        
+        # Initialize filters with zeros to prevent None
+        self.filters = None
+        self.initialized = False
+        
+        # Add input dimensions
+        self.in_channels = None
+        self.input_height = None
+        self.input_width = None
     
     def _initialize_params(self, input_shape):
         """Initialize filters based on input shape"""
         batch_size, in_channels, height, width = input_shape
         self.in_channels = in_channels
-        self.height = height
-        self.width = width
-        self.batch_size = batch_size
+        self.input_height = height
+        self.input_width = width
         
+        # Only initialize if not already done
         if not self.initialized:
-            scale = np.sqrt(self.in_channels * self.filter_size * self.filter_size)
+            scale = np.sqrt(2.0 / (in_channels * self.filter_size * self.filter_size))
             self.filters = to_gpu(np.random.randn(
                 self.num_filters, 
-                self.in_channels, 
+                in_channels,
                 self.filter_size, 
                 self.filter_size
-            ) / scale)
+            ) * scale)
             self.v = to_gpu(np.zeros_like(self.filters))
             self.initialized = True
 
@@ -186,14 +221,46 @@ class ConvLayer:
         
         cudnn.set_convolution2d_descriptor(
             self.conv_desc,
-            0, 0,  # padding
-            1, 1,  # stride
+            self.pad_h, self.pad_w,  # padding
+            self.stride, self.stride,  # stride
             1, 1,  # dilation
             cudnn.CUDNN_CROSS_CORRELATION,
             cudnn.CUDNN_DATA_FLOAT
         )
         
     def forward(self, inputs):
+        try:
+            inputs = to_gpu(inputs)
+            # Initialize parameters if needed
+            if not self.initialized:
+                self._initialize_params(inputs.shape)
+            
+            # Verify filter initialization
+            if self.filters is None:
+                raise ValueError("Filters not properly initialized")
+                
+            # Choose forward implementation
+            if self.use_cudnn:
+                try:
+                    return self._forward_cudnn(inputs)
+                except Exception as e:
+                    print(f"cuDNN forward failed: {e}, falling back to direct")
+            
+            return self._forward_direct(inputs)
+            
+        except Exception as e:
+            print(f"Error in ConvLayer forward pass: {e}")
+            raise
+
+    def _forward_implementation(self, inputs):
+        # Validate input shape
+        if len(inputs.shape) != 4:
+            raise ShapeError(
+                "Invalid input shape",
+                expected_shape=(None, self.in_channels, None, None),
+                actual_shape=inputs.shape
+            )
+            
         inputs = to_gpu(inputs)
         self.inputs = inputs
         
@@ -396,6 +463,72 @@ class ConvLayer:
         
         return y
 
+    def _backward_cudnn(self, dout):
+        """Backward pass using cuDNN"""
+        if not self.use_cudnn:
+            return self._backward_direct(dout)
+            
+        try:
+            # Data gradient
+            dx = cp.empty_like(self.inputs)
+            cudnn.convolution_backward_data(
+                1.0,  # alpha
+                self.w_desc, self.filters,
+                self.y_desc, dout,
+                self.conv_desc,
+                0.0,  # beta
+                self.x_desc, dx
+            )
+            
+            # Filter gradient
+            dw = cp.empty_like(self.filters)
+            cudnn.convolution_backward_filter(
+                1.0,  # alpha
+                self.x_desc, self.inputs,
+                self.y_desc, dout,
+                self.conv_desc,
+                0.0,  # beta
+                self.w_desc, dw
+            )
+            
+            return dx, dw
+            
+        except Exception as e:
+            print(f"cuDNN backward failed: {e}, falling back to direct")
+            return self._backward_direct(dout)
+
+    def backward(self, dout):
+        dout = to_gpu(dout)
+        
+        try:
+            if self.use_cudnn:
+                dx, dw = self._backward_cudnn(dout)
+            else:
+                dx, dw = self._backward_direct(dout)
+                
+            # Gradient clipping
+            clip_threshold = 5.0
+            dw = self.xp.clip(dw, -clip_threshold, clip_threshold)
+            
+            # Update with chosen optimizer
+            if hasattr(self, 'optimizer'):
+                self.filters = self.optimizer.update(self.filters, dw, f'conv_layer_{id(self)}')
+            else:
+                # Default momentum update
+                self.v = self.momentum * self.v - self.learning_rate * dw
+                self.filters += self.v
+            
+            # Memory cleanup
+            if self.use_gpu and self.memory_cleanup_counter % 2 == 0:
+                clear_gpu_memory(100)
+            self.memory_cleanup_counter += 1
+            
+            return dx
+            
+        except Exception as e:
+            print(f"Error in backward pass: {e}")
+            raise
+
     def backward(self, dout):
         dout = to_gpu(dout)
         dx = self.xp.zeros_like(self.inputs)
@@ -419,6 +552,52 @@ class ConvLayer:
         self.memory_cleanup_counter += 1
         
         return dx
+
+    def _backward_direct(self, dout):
+        """Direct backward pass implementation"""
+        dx = self.xp.zeros_like(self.inputs)
+        dw = self.xp.zeros_like(self.filters)
+        
+        # Add gradient checking in debug mode
+        if hasattr(self, 'debug_mode') and self.debug_mode:
+            self._check_gradients(dout)
+        
+        # Implement gradient accumulation for large batches
+        if dout.shape[0] > self.chunk_size:
+            return self._backward_chunked(dout)
+            
+        # ... rest of backward implementation ...
+
+    def _check_gradients(self, dout):
+        """Gradient checking using finite differences"""
+        epsilon = 1e-7
+        numerical_gradients = self.xp.zeros_like(self.filters)
+        
+        # Compute numerical gradients for a subset of weights
+        for i in range(min(self.num_filters, 2)):
+            for j in range(min(self.in_channels, 2)):
+                original = self.filters[i,j,0,0].copy()
+                
+                # f(x + h)
+                self.filters[i,j,0,0] = original + epsilon
+                out_plus = self._forward_direct(self.inputs)
+                cost_plus = self.xp.sum(out_plus * dout)
+                
+                # f(x - h)
+                self.filters[i,j,0,0] = original - epsilon
+                out_minus = self._forward_direct(self.inputs)
+                cost_minus = self.xp.sum(out_minus * dout)
+                
+                # (f(x + h) - f(x - h)) / 2h
+                numerical_gradients[i,j,0,0] = (cost_plus - cost_minus) / (2 * epsilon)
+                self.filters[i,j,0,0] = original
+        
+        # Compare with analytical gradients
+        analytical_gradients = self._compute_weight_gradients(dout)
+        diff = self.xp.abs(numerical_gradients - analytical_gradients)
+        
+        if self.xp.max(diff) > 1e-5:
+            print(f"Gradient check failed! Max difference: {self.xp.max(diff)}")
 
     def save_params(self, path, layer_name):
         """Save convolutional layer parameters"""

@@ -185,219 +185,80 @@ class LiveDisplay:
 
 # Update EnhancedProgressMonitor to use LiveDisplay
 class EnhancedProgressMonitor:
+    """Enhanced progress monitor for training process"""
     def __init__(self, total_epochs):
-        self.display = LiveDisplay(total_epochs)
         self.total_epochs = total_epochs
-        self.current_epoch = 0
-        self.term_width = shutil.get_terminal_size().columns
-        self.best_metrics = {
-            'train_acc': 0,
-            'val_acc': 0,
-            'train_loss': float('inf'),
-            'val_loss': float('inf')
-        }
-        self.current_layer_info = None
-        self.metrics_history = {
-            'train_loss': deque(maxlen=100),
-            'train_acc': deque(maxlen=100),
-            'val_loss': deque(maxlen=100),
-            'val_acc': deque(maxlen=100)
-        }
         self.current_batch = 0
         self.total_batches = 0
-        self.current_metrics = {}  # Add this to store current metrics
-    
-    def print_header(self):
-        """Print the initial header with logo"""
-        print(AsciiArt.LOGO)
-        if GPU_AVAILABLE:
-            print(f"{Fore.GREEN}GPU Mode: Enabled{Style.RESET_ALL}")
-        else:
-            print(f"{Fore.YELLOW}GPU Mode: Disabled (Using CPU){Style.RESET_ALL}")
-        print(f"{Fore.CYAN}{'=' * self.term_width}{Style.RESET_ALL}")
-    
-    def print_section_header(self, text):
-        """Print a beautifully formatted section header"""
-        header = AsciiArt.SECTION_HEADER.format(text.center(self.term_width - 4))
-        print(header)
-    
-    def print_training_params(self, batch_size, epochs, learning_rate):
-        """Print training parameters in a styled box"""
-        params_box = AsciiArt.PARAMS_BOX.format(batch_size, epochs, learning_rate)
-        print(params_box)
-    
+        self.epoch_start_time = None
+        self.train_bar = None
+        self.val_bar = None
+        
     def print_epoch_header(self, epoch):
-        self.current_epoch = epoch
-        print(f"\n{Fore.CYAN}{'=' * self.term_width}{Style.RESET_ALL}")
-        print(f"{Fore.WHITE}Epoch {Fore.GREEN}{epoch}/{self.total_epochs}{Style.RESET_ALL}".center(self.term_width))
-        print(f"{Fore.CYAN}{'=' * self.term_width}{Style.RESET_ALL}\n")
-    
-    def update_layer_info(self, layer_info):
-        """Update current layer information"""
-        self.current_layer_info = layer_info
-        if not hasattr(self, 'current_metrics'):
-            self.current_metrics = {}
-        if not hasattr(self, 'current_batch'):
-            self.current_batch = 0
-        if not hasattr(self, 'total_batches'):
-            self.total_batches = 0
-            
-        self.display.update_display(
-            self.current_epoch,
-            self.current_batch,
-            self.total_batches,
-            self.current_metrics,
-            layer_info
-        )
-    
-    def update_batch_progress(self, batch_idx, total_batches, metrics):
-        """Update batch and sample progress with metrics"""
-        self.current_batch = batch_idx
-        self.total_batches = total_batches
+        """Print formatted epoch header"""
+        print("\n" + "="*70)
+        print(f"{Fore.CYAN}Epoch {epoch}/{self.total_epochs}".center(70))
+        print("="*70)
+        self.epoch_start_time = time.time()
         
-        # Initialize current_metrics if needed
-        if not hasattr(self, 'current_metrics'):
-            self.current_metrics = {}
+    def print_metrics(self, metrics):
+        """Print formatted metrics"""
+        duration = time.time() - self.epoch_start_time
         
-        # Update metrics history
-        for name, value in metrics.items():
-            if name not in self.metrics_history:
-                self.metrics_history[name] = deque(maxlen=100)
-            self.metrics_history[name].append(value)
+        print("\n" + "-"*70)
+        print(f"{Fore.YELLOW}Training Metrics:")
+        print(f"  Loss: {metrics['train_loss']:.4f}")
+        print(f"  Accuracy: {metrics['train_acc']:.4f}")
         
-        # Calculate averages
-        avg_metrics = {name: np.mean(values) for name, values in self.metrics_history.items()}
-        self.current_metrics = {
-            name: {
-                'current': value,
-                'average': avg_metrics[name],
-                'best': self.best_metrics.get(name, value)
-            } 
-            for name, value in metrics.items()
-        }
+        print(f"\n{Fore.GREEN}Validation Metrics:")
+        print(f"  Loss: {metrics['val_loss']:.4f}")
+        print(f"  Accuracy: {metrics['val_acc']:.4f}")
         
-        self.display.update_display(
-            self.current_epoch,
-            batch_idx,
-            total_batches,
-            self.current_metrics,
-            self.current_layer_info
-        )
-    
-    def print_metrics(self, current_metrics):
-        """Display current and best metrics"""
-        print(f"\n\n{Fore.CYAN}Training Statistics:{Style.RESET_ALL}")
-        
-        headers = [f"{Fore.WHITE}Metric", f"{Fore.WHITE}Current", f"{Fore.WHITE}Best", f"{Fore.WHITE}Trend"]
-        print(f"{Fore.WHITE}{'=' * 60}{Style.RESET_ALL}")
-        print(f"{headers[0]:<15} {headers[1]:>12} {headers[2]:>12} {headers[3]:>12}")
-        print(f"{Fore.WHITE}{'=' * 60}{Style.RESET_ALL}")
-        
-        metrics_info = [
-            ('Train Loss', current_metrics['train_loss'], self.best_metrics['train_loss'], 'loss'),
-            ('Train Acc', current_metrics['train_acc'], self.best_metrics['train_acc'], 'acc'),
-            ('Val Loss', current_metrics['val_loss'], self.best_metrics['val_loss'], 'loss'),
-            ('Val Acc', current_metrics['val_acc'], self.best_metrics['val_acc'], 'acc')
-        ]
-        
-        for name, current, best, metric_type in metrics_info:
-            if metric_type == 'loss':
-                is_better = current < best
-                print(f"{Fore.WHITE}{name:<15} "
-                      f"{Fore.GREEN if is_better else Fore.RED}{current:>12.4f} "
-                      f"{Fore.YELLOW}{best:>12.4f} "
-                      f"{Fore.GREEN if is_better else Fore.RED}{'↓' if is_better else '↑':>12}{Style.RESET_ALL}")
-            else:
-                is_better = current > best
-                print(f"{Fore.WHITE}{name:<15} "
-                      f"{Fore.GREEN if is_better else Fore.RED}{current:>12.2%} "
-                      f"{Fore.YELLOW}{best:>12.2%} "
-                      f"{Fore.GREEN if is_better else Fore.RED}{'↑' if is_better else '↓':>12}{Style.RESET_ALL}")
-        
-        print(f"{Fore.WHITE}{'=' * 60}{Style.RESET_ALL}")
+        print(f"\n{Fore.BLUE}Time: {duration:.2f}s")
+        print("-"*70 + "\n")
+        sys.stdout.flush()
 
 class EnhancedBatchProgress:
-    def __init__(self, total_batches, total_samples, desc="Processing", leave=True):
+    """Enhanced progress bar for batch processing"""
+    def __init__(self, total_batches, total_samples, desc=""):
+        self.total_batches = total_batches
         self.total_samples = total_samples
-        self.samples_processed = 0
-        
-        # Simpler bar format that works with tqdm
-        self.bar_format = (
-            '{desc}: {percentage:3.0f}%|{bar}| '
-            '{n_fmt}/{total_fmt} '
-            '[{elapsed}<{remaining}, {rate_fmt}] '
-            '({postfix})'
-        )
-        
-        # Add immediate feedback
-        print(f"\n{desc} starting... Total batches: {total_batches}")
-        
-        self.progress_bar = tqdm(
-            total=total_batches,
+        self.desc = desc
+        self.pbar = tqdm(
+            total=total_samples,
             desc=desc,
-            leave=leave,
-            bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} '
-                      '[{elapsed}<{remaining}] [{postfix}]',
-            ascii=" ▏▎▍▌▋▊▉█",
-            ncols=100,
-            dynamic_ncols=True,
-            smoothing=0.3,
-            mininterval=0.1,  # Update more frequently
-            unit='batch'
+            bar_format="{desc}: {percentage:3.0f}%|{bar:30}| "
+                      "{n_fmt}/{total_fmt} samples "
+                      "[{elapsed}<{remaining}, {rate_fmt}]"
         )
+        self.current_metrics = {}
         
-        self.metrics = deque(maxlen=10)
-        self.last_value = {}  # Store last values for trend indicators
+    def update(self, samples_in_batch, loss=None, acc=None, batch=None):
+        """Update progress bar with new metrics"""
+        self.pbar.update(samples_in_batch)
         
-        # Add accuracy to postfix format
-        self.postfix_fmt = (
-            "loss: {loss} • acc: {acc} • "
-            "samples: {samples}"
-        )
-    
-    def format_metric(self, name, value):
-        """Format metrics with colors based on type"""
-        if 'loss' in name.lower():
-            if value < 0.5:
-                prefix = "🟢"  # Green circle for good loss
-            elif value < 1.0:
-                prefix = "🟡"  # Yellow circle for okay loss
-            else:
-                prefix = "🔴"  # Red circle for bad loss
-            return f"{prefix} {value:.4f}"
-        else:
-            if value > 0.9:
-                prefix = "🌟"  # Star for exceptional accuracy
-            elif value > 0.8:
-                prefix = "🟢"  # Green for good accuracy
-            elif value > 0.6:
-                prefix = "🟡"  # Yellow for okay accuracy
-            else:
-                prefix = "🔴"  # Red for poor accuracy
-            # Add percentage and trend indicators
-            trend = "↗️" if value > self.last_value[name] else "↘️" if value < self.last_value[name] else "➡️"
-            self.last_value[name] = value
-            return f"{prefix} {value:.2%} {trend}"
-    
-    def update(self, samples_in_batch, **metrics):
-        self.samples_processed += samples_in_batch
-        self.metrics.append(metrics)
+        # Update metrics display
+        metrics_str = []
+        if loss is not None:
+            metrics_str.append(f"loss: {loss:.4f}")
+        if acc is not None:
+            metrics_str.append(f"acc: {acc:.4f}")
+        if batch is not None:
+            metrics_str.append(f"batch: {batch}/{self.total_batches}")
+            
+        if metrics_str:
+            self.pbar.set_postfix_str(" - ".join(metrics_str))
         
-        # Format current metrics
-        current_metrics = {
-            k: f"{v:.4f}" if 'loss' in k else f"{v:.2%}"
-            for k, v in metrics.items()
-        }
-        
-        # Add batch counter
-        current_metrics['batch'] = f"{self.progress_bar.n + 1}/{self.progress_bar.total}"
-        
-        # Add sample progress
-        current_metrics['samples'] = f"{self.samples_processed}/{self.total_samples}"
-        
-        # Update progress bar
-        self.progress_bar.set_postfix(current_metrics, refresh=True)
-        self.progress_bar.update(1)
-    
     def close(self):
-        self.progress_bar.close()
+        """Close progress bar"""
+        self.pbar.close()
+
+def print_gpu_status(gpu_info):
+    """Print formatted GPU status"""
+    if gpu_info:
+        print(f"\n{Fore.CYAN}GPU Status:")
+        print(f"  Device: {gpu_info['name']}")
+        print(f"  Memory: {gpu_info['total_memory']/1e9:.1f}GB")
+        print(f"  CUDA: {gpu_info['cuda_version']}")
+    else:
+        print(f"\n{Fore.YELLOW}GPU not available")

@@ -59,12 +59,59 @@ def get_gpu_config():
     except:
         return None
 
+def check_cudnn_installation():
+    """Detailed check of cuDNN installation"""
+    if not GPU_AVAILABLE:
+        print("CUDA is not available")
+        return False
+        
+    try:
+        import cupy as cp
+        cuda_version = cp.cuda.runtime.runtimeGetVersion()
+        print(f"CUDA Version: {cuda_version}")
+        
+        # Check cuDNN
+        if hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available:
+            cudnn_version = cp.cuda.cudnn.getVersion()
+            print(f"cuDNN Version: {cudnn_version}")
+            return True
+        else:
+            # Detailed error checking
+            if not hasattr(cp.cuda, 'cudnn'):
+                print("cuDNN module not found in CuPy")
+            elif not cp.cuda.cudnn.available:
+                print("cuDNN is installed but not available")
+                
+            # Check library path
+            import os
+            library_paths = os.environ.get('LD_LIBRARY_PATH', '').split(':')
+            cudnn_found = False
+            for path in library_paths:
+                if os.path.exists(os.path.join(path, 'libcudnn.so')):
+                    cudnn_found = True
+                    print(f"Found cuDNN in: {path}")
+            if not cudnn_found:
+                print("libcudnn.so not found in LD_LIBRARY_PATH")
+                
+            return False
+            
+    except ImportError as e:
+        print(f"Error importing CuPy/cuDNN: {e}")
+        return False
+    except Exception as e:
+        print(f"Error checking cuDNN: {e}")
+        return False
+
 def configure_gpu():
     """Configure GPU and return status and config"""
     if not GPU_AVAILABLE:
         return False, None
 
     try:
+        # First check CUDA and cuDNN
+        print("\nChecking CUDA and cuDNN installation:")
+        cudnn_available = check_cudnn_installation()
+        
         gpu_config = get_gpu_config()
         if gpu_config is None:
             return False, None
@@ -74,19 +121,18 @@ def configure_gpu():
         # Configure memory pool
         cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
         
-        # Configure cuDNN if available
-        if hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available:
+        # Configure cuDNN
+        if cudnn_available:
             try:
-                # Enable cuDNN autotuning
-                cp.cuda.runtime.setDeviceFlags(cp.cuda.runtime.cudaDeviceMapHost)
-                # Note: newer versions of CuPy handle cuDNN enablement automatically
-                
-                # Get cuDNN version
-                cudnn_version = cp.cuda.cudnn.getVersion()
-                print(f"cuDNN Version: {cudnn_version}")
-                gpu_config['cudnn_version'] = cudnn_version
+                # Try to initialize cuDNN
+                cp.cuda.cudnn.get_handle()
+                gpu_config['cudnn_available'] = True
+                gpu_config['cudnn_version'] = cp.cuda.cudnn.getVersion()
             except Exception as e:
-                print(f"cuDNN configuration warning: {e}")
+                print(f"Warning: cuDNN initialization failed: {e}")
+                gpu_config['cudnn_available'] = False
+        else:
+            gpu_config['cudnn_available'] = False
         
         device.use()
         
@@ -94,7 +140,9 @@ def configure_gpu():
         print(f"Total Memory: {gpu_config['total_memory']:.1f}GB")
         print(f"Mode: {'High Memory' if gpu_config['is_high_memory'] else 'Low Memory'}")
         print(f"Optimal Batch Size: {gpu_config['optimal_batch_size']}")
-        print(f"cuDNN Available: {hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available}")
+        print(f"cuDNN Available: {gpu_config['cudnn_available']}")
+        if gpu_config['cudnn_available']:
+            print(f"cuDNN Version: {gpu_config['cudnn_version']}")
         
         return True, gpu_config
 

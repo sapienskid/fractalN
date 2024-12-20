@@ -14,11 +14,22 @@ import os
 from PIL import Image
 import psutil
 import GPUtil
-from gpu_utils import configure_gpu, clear_gpu_memory, to_gpu, to_cpu, GPU_AVAILABLE
-from progress_monitor import EnhancedProgressMonitor, EnhancedBatchProgress
+from gpu_utils import configure_gpu, clear_gpu_memory, to_gpu, to_cpu, GPU_AVAILABLE, get_gpu_info
+from progress_monitor import EnhancedProgressMonitor, EnhancedBatchProgress, print_gpu_status
 from colorama import Fore, Style, init
 from logger import TrainingLogger
+from optimizers import Adam, RMSprop, LearningRateScheduler, AdaptiveMomentum, AdaptiveLearningRate
+from exceptions import ValidationError, ShapeError, GPUError, MemoryError, GPUMemoryTracker
 init(autoreset=True)
+
+class ValidationContext:
+    """Context manager for validation phase"""
+    def __enter__(self):
+        self.training_state = False
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.training_state = True
 
 def print_header(text):
     print("\n" + "="*50)
@@ -46,6 +57,20 @@ def get_memory_usage():
         'GPU': "Not Available"
     }
 
+def calculate_loss(predictions, labels):
+    """Calculate cross entropy loss ensuring consistent array types"""
+    xp = cp if GPU_AVAILABLE else np
+    predictions = to_gpu(predictions)
+    labels = to_gpu(labels)
+    
+    # Add small epsilon to prevent log(0)
+    epsilon = 1e-7
+    predictions = xp.clip(predictions, epsilon, 1-epsilon)
+    
+    # Calculate cross entropy loss
+    loss = -xp.sum(labels * xp.log(predictions)) / len(labels)
+    return float(to_cpu(loss))
+
 def calculate_accuracy(predictions, labels):
     """Calculate accuracy ensuring consistent array types"""
     predictions = to_cpu(predictions)
@@ -57,146 +82,168 @@ def train():
     logger = TrainingLogger()
     
     # Configure GPU first and get status
-    is_gpu_available = configure_gpu()
+    is_gpu_available, gpu_config = configure_gpu()
     
-    # Training parameters
-    batch_size = 8
+    # Training parameters with adaptive components
+    batch_size = gpu_config['optimal_batch_size'] if gpu_config else 8
     epochs = 10
-    learning_rate = 0.01
+    initial_lr = 0.01
     
-    # Initialize data loader
-    data_loader = DataLoader('data/processed_mushroom_dataset', batch_size=batch_size)
+    # Initialize optimizers and schedulers
+    optimizer = Adam(learning_rate=initial_lr)
+    lr_scheduler = LearningRateScheduler(initial_lr=initial_lr)
+    momentum_adapter = AdaptiveMomentum(base_momentum=0.9)
+    adaptive_lr = AdaptiveLearningRate(initial_lr=initial_lr)
     
-    # Get data splits
-    train_indices, val_indices, test_indices = data_loader.split_indices()
-    
-    # Initialize model and monitor
-    model = CNN()
-    monitor = EnhancedProgressMonitor(total_epochs=epochs)
-    model.monitor = monitor  # Set monitor in model
-    
-    # Initialize batch tracking
-    monitor.current_batch = 0
-    monitor.total_batches = len(train_indices) // batch_size
-    
-    # Log training start
-    logger.log_training_start(batch_size, epochs, learning_rate)
-    
-    # Add debug print
-    print(f"{Fore.CYAN}Total training batches: {monitor.total_batches}")
-    print(f"Total validation batches: {len(val_indices) // batch_size}{Style.RESET_ALL}\n")
-    
-    # Training loop
-    print_header("Starting Training")
-    monitor.print_training_params(batch_size, epochs, learning_rate)
-    
-    start_time = datetime.now()
-    best_accuracy = 0
-    
-    for epoch in range(epochs):
-        monitor.print_epoch_header(epoch + 1)
+    try:
+        # Initialize data loader with validation
+        data_loader = DataLoader('data/processed_mushroom_dataset', batch_size=batch_size)
         
-        # Training phase
-        train_progress = EnhancedBatchProgress(
-            total_batches=len(train_indices) // batch_size,
-            total_samples=len(train_indices),
-            desc=f"🚂 Training"  # Using emoji instead of color codes
-        )
+        # Get data splits
+        train_indices, val_indices, test_indices = data_loader.split_indices()
         
-        # Add batch counter
-        batch_counter = 0
-        batch_metrics = []
+        # Initialize model with optimizers
+        model = CNN(optimizer='adam', lr=initial_lr)
+        monitor = EnhancedProgressMonitor(total_epochs=epochs)
+        model.monitor = monitor
         
-        for batch_images, batch_labels in data_loader.get_batches():
-            monitor.current_batch += 1  # Update batch counter
-            batch_counter += 1
-            # Add debug print every few batches
-            if batch_counter % 5 == 0:
-                print(f"\rProcessing batch {batch_counter}", end="")
+        # Initialize batch tracking
+        monitor.current_batch = 0
+        monitor.total_batches = len(train_indices) // batch_size
+        
+        # Log training start
+        logger.log_training_start(batch_size, epochs, initial_lr)
+        
+        # Training loop with memory tracking and adaptive components
+        best_accuracy = 0
+        patience_counter = 0
+        
+        print_gpu_status(get_gpu_info())  # Add this line
+        
+        for epoch in range(epochs):
+            with GPUMemoryTracker(threshold_mb=1000) as memory_tracker:
+                # Update learning rate using scheduler
+                current_lr = lr_scheduler.cosine_decay(epoch, epochs)
+                optimizer.learning_rate = current_lr
                 
-            if is_gpu_available:
-                batch_images = to_gpu(batch_images)
-                batch_labels = to_gpu(batch_labels)
+                monitor.print_epoch_header(epoch + 1)
                 
-            loss, predictions = model.train_step(batch_images, batch_labels)
-            accuracy = calculate_accuracy(predictions, batch_labels)
-            
-            train_progress.update(
-                samples_in_batch=len(batch_images),
-                loss=loss,
-                acc=accuracy,
-                batch=batch_counter
-            )
-            
-            # Add current metrics to monitor
-            monitor.update_batch_progress(
-                monitor.current_batch,
-                monitor.total_batches,
-                {'loss': loss, 'acc': accuracy}
-            )
-            
-            batch_metrics.append({'loss': loss, 'acc': accuracy})
-            
-            # Memory cleanup
-            if is_gpu_available:
-                clear_gpu_memory()
-        train_progress.close()
-        
-        # Validation phase
-        val_progress = EnhancedBatchProgress(
-            total_batches=len(val_indices) // batch_size,
-            total_samples=len(val_indices),
-            desc=f"🔍 Validation"  # Using emoji instead of color codes
-        )
-        
-        val_metrics = []
-        for batch_images, batch_labels in data_loader.get_batches():
-            if is_gpu_available:
-                batch_images = to_gpu(batch_images)
-                batch_labels = to_gpu(batch_labels)
+                # Training phase with gradient accumulation
+                train_progress = EnhancedBatchProgress(
+                    total_batches=len(train_indices) // batch_size,
+                    total_samples=len(train_indices),
+                    desc=f"🚂 Training"
+                )
                 
-            predictions = model.forward(batch_images, training=False)
-            val_loss = -np.sum(batch_labels * np.log(predictions + 1e-7)) / len(batch_labels)
-            val_accuracy = np.mean(np.argmax(predictions, axis=1) == np.argmax(batch_labels, axis=1))
-            
-            val_progress.update(
-                samples_in_batch=len(batch_images),
-                loss=val_loss,
-                acc=val_accuracy
-            )
-            val_metrics.append({'loss': val_loss, 'acc': val_accuracy})
-        val_progress.close()
-        
-        # Update and display metrics
-        current_metrics = {
-            'train_loss': np.mean([m['loss'] for m in batch_metrics]),
-            'train_acc': np.mean([m['acc'] for m in batch_metrics]),
-            'val_loss': np.mean([m['loss'] for m in val_metrics]),
-            'val_acc': np.mean([m['acc'] for m in val_metrics])
-        }
-        
-        monitor.print_metrics(current_metrics)
-        
-        # Log epoch metrics
-        logger.log_epoch_progress(epoch + 1, epochs, current_metrics)
-        
-        # Save best model if needed
-        if current_metrics['val_acc'] > monitor.best_metrics['val_acc']:
-            monitor.best_metrics['val_acc'] = current_metrics['val_acc']
-            logger.log("\nNew best accuracy achieved! Saving model...")
-            print(f"\n{Fore.GREEN}New best accuracy! Saving model...{Style.RESET_ALL}")
-            save_path = os.path.join("models", "saved_models", "best_model")
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            model.save(save_path)
+                train_metrics = []
+                batch_counter = 0
+                
+                for batch_images, batch_labels in data_loader.get_batches():
+                    try:
+                        # Memory-efficient training step
+                        loss, predictions = model.train_step(batch_images, batch_labels)
+                        accuracy = calculate_accuracy(predictions, batch_labels)
+                        
+                        batch_counter += 1
+                        train_progress.update(
+                            samples_in_batch=len(batch_images),
+                            loss=loss,
+                            acc=accuracy,
+                            batch=batch_counter
+                        )
+                        
+                        train_metrics.append({
+                            'loss': loss,
+                            'accuracy': accuracy
+                        })
+                        
+                        # Adaptive momentum based on gradients
+                        if hasattr(model, 'layers'):
+                            for layer in model.layers:
+                                if hasattr(layer, 'optimizer'):
+                                    layer.momentum = momentum_adapter.get_momentum(
+                                        f'layer_{id(layer)}',
+                                        getattr(layer, 'last_gradient', None)
+                                    )
+                        
+                    except MemoryError as e:
+                        logger.log(f"Memory error in batch: {str(e)}")
+                        clear_gpu_memory(0)
+                        continue
+                    
+                train_progress.close()
+                
+                # Validation phase
+                val_progress = EnhancedBatchProgress(
+                    total_batches=len(val_indices) // batch_size,
+                    total_samples=len(val_indices),
+                    desc=f"🔍 Validation"
+                )
+                
+                val_metrics = []
+                with ValidationContext():
+                    for batch_images, batch_labels in data_loader.get_batches(validation=True):
+                        predictions = model.forward(batch_images, training=False)
+                        val_loss = calculate_loss(predictions, batch_labels)
+                        val_accuracy = calculate_accuracy(predictions, batch_labels)
+                        
+                        val_progress.update(
+                            samples_in_batch=len(batch_images),
+                            loss=val_loss,
+                            acc=val_accuracy
+                        )
+                        
+                        val_metrics.append({
+                            'loss': val_loss,
+                            'accuracy': val_accuracy
+                        })
+                
+                val_progress.close()
+                
+                # Calculate epoch metrics
+                epoch_metrics = {
+                    'train_loss': np.mean([m['loss'] for m in train_metrics]),
+                    'train_acc': np.mean([m['accuracy'] for m in train_metrics]),
+                    'val_loss': np.mean([m['loss'] for m in val_metrics]),
+                    'val_acc': np.mean([m['accuracy'] for m in val_metrics])
+                }
+                
+                # Adaptive learning rate adjustment
+                if adaptive_lr.should_reduce_lr(epoch_metrics['val_loss']):
+                    logger.log(f"Reducing learning rate to {adaptive_lr.current_lr}")
+                    optimizer.learning_rate = adaptive_lr.current_lr
+                
+                # Save best model
+                if epoch_metrics['val_acc'] > best_accuracy:
+                    best_accuracy = epoch_metrics['val_acc']
+                    patience_counter = 0
+                    save_path = os.path.join("models", "saved_models", "best_model")
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    model.save(save_path)
+                else:
+                    patience_counter += 1
+                
+                # Early stopping
+                if patience_counter >= 5:  # 5 epochs without improvement
+                    logger.log("Early stopping triggered")
+                    break
+                
+                # Log epoch results
+                logger.log_epoch_progress(epoch + 1, epochs, epoch_metrics)
+                monitor.print_metrics(epoch_metrics)
+                
+                # Log memory usage
+                memory_usage = get_memory_usage()
+                logger.log(f"Memory usage - RAM: {memory_usage['RAM']}, GPU: {memory_usage['GPU']}")
+                
+    except Exception as e:
+        logger.log(f"Training failed: {str(e)}")
+        raise
     
-    training_time = datetime.now() - start_time
-    
-    print_header("Training Complete")
-    print(f"Total training time: {training_time}")
-    print(f"Best accuracy achieved: {best_accuracy:.2%}")
-    
-    # Log training completion
-    logger.log_training_complete(best_accuracy)
+    finally:
+        # Cleanup
+        if is_gpu_available:
+            clear_gpu_memory(0)
 
 def load_image(image_path):
     """Load a preprocessed image for prediction"""
