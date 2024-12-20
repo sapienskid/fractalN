@@ -126,14 +126,16 @@ class ConvLayer:
         self.min_fft_size = 32  # Minimum size for using FFT
         self.memory_cleanup_counter = 0
 
-        self.padding = padding
-        self.stride = stride
-        self.pad_h = 0
-        self.pad_w = 0
+        self.stride = stride  # Ensure stride is an integer
+        self.stride_tuple = (stride, stride)  # Tuple for cuDNN functions
         
         if padding == 'same':
             self.pad_h = (filter_size - 1) // 2
             self.pad_w = (filter_size - 1) // 2
+        else:
+            self.pad_h = 0
+            self.pad_w = 0
+        self.pad = (self.pad_h, self.pad_w)
 
         # Check GPU memory capacity
         self.is_high_memory = False
@@ -420,16 +422,16 @@ class ConvLayer:
         return output
 
     def _forward_cudnn(self, inputs):
-        """Forward pass using cuDNN's simplified API"""
+        """Forward pass using cuDNN"""
         try:
-            return cp.cuda.cudnn.convolution_forward(
-                inputs, 
+            output = cp.nn.convolution(
+                inputs,
                 self.filters,
-                pad=self.pad,
-                stride=self.stride,
-                dilation=self.dilation,
-                groups=1
+                stride=self.stride_tuple,
+                padding=self.pad,
+                dilation=1
             )
+            return output
         except Exception as e:
             print(f"cuDNN forward failed: {e}, falling back to direct")
             return self._forward_direct(inputs)
@@ -503,29 +505,25 @@ class ConvLayer:
         # ... rest of backward implementation ...
 
     def _backward_cudnn(self, dout):
-        """Backward pass using cuDNN's simplified API"""
+        """Backward pass using cuDNN"""
         try:
             # Compute gradients
-            dx = cp.cuda.cudnn.convolution_backward_data(
-                dout, 
-                self.filters,
+            dx = cp.nn.grad.conv_input(
                 self.inputs.shape,
-                pad=self.pad,
-                stride=self.stride,
-                dilation=self.dilation,
-                groups=1
+                self.filters,
+                dout,
+                stride=self.stride_tuple,
+                padding=self.pad,
+                dilation=1
             )
-            
-            dw = cp.cuda.cudnn.convolution_backward_filter(
-                self.inputs, 
+            dw = cp.nn.grad.conv_weight(
+                self.inputs,
                 dout,
                 self.filters.shape,
-                pad=self.pad,
-                stride=self.stride,
-                dilation=self.dilation,
-                groups=1
+                stride=self.stride_tuple,
+                padding=self.pad,
+                dilation=1
             )
-            
             return dx, dw
         except Exception as e:
             print(f"cuDNN backward failed: {e}, falling back to direct")
