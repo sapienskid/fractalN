@@ -445,11 +445,55 @@ class ConvLayer:
             return self._forward_direct(inputs)
 
     def backward(self, dout):
+        """Backward pass with proper shape handling"""
         dout = to_gpu(dout)
         
         try:
-            dx, dw = self._backward_direct(dout)
-                
+            if self.use_cudnn:
+                try:
+                    return self._backward_cudnn(dout)
+                except Exception as e:
+                    print(f"cuDNN backward failed: {e}, falling back to direct")
+            
+            dx = self.xp.zeros_like(self.inputs)
+            dw = self.xp.zeros_like(self.filters)
+            
+            # Apply padding to input if needed
+            if self.padding == 'same':
+                padded_inputs = self.xp.pad(
+                    self.inputs,
+                    self.pad,
+                    'constant'
+                )
+            else:
+                padded_inputs = self.inputs
+            
+            # Calculate gradients
+            batch_size, _, out_h, out_w = dout.shape
+            
+            for i in range(out_h):
+                for j in range(out_w):
+                    h_start = i * self.stride_int
+                    h_end = h_start + self.filter_size
+                    w_start = j * self.stride_int
+                    w_end = w_start + self.filter_size
+                    
+                    # Get the current input patch
+                    input_slice = padded_inputs[:, :, h_start:h_end, w_start:w_end]
+                    
+                    for k in range(self.num_filters):
+                        # Calculate filter gradients
+                        dout_k = dout[:, k, i, j].reshape(-1, 1, 1, 1)
+                        dw[k] += self.xp.sum(input_slice * dout_k, axis=0)
+                        
+                        # Calculate input gradients
+                        if self.padding == 'same':
+                            dx_slice = dx[:, :, h_start:h_end, w_start:w_end]
+                            dx_slice += self.filters[k] * dout_k
+                        else:
+                            dx[:, :, h_start:h_end, w_start:w_end] += \
+                                self.filters[k] * dout_k
+            
             # Gradient clipping
             clip_threshold = 5.0
             dw = self.xp.clip(dw, -clip_threshold, clip_threshold)
@@ -472,30 +516,6 @@ class ConvLayer:
         except Exception as e:
             print(f"Error in backward pass: {e}")
             raise
-
-    def backward(self, dout):
-        dout = to_gpu(dout)
-        dx = self.xp.zeros_like(self.inputs)
-        dw = self.xp.zeros_like(self.filters)
-        
-        for i in range(dout.shape[2]):
-            for j in range(dout.shape[3]):
-                input_slice = self.inputs[:, :, i:i+self.filter_size, j:j+self.filter_size]
-                for k in range(self.num_filters):
-                    dw[k] += self.xp.sum(input_slice * dout[:, k, i, j][:, None, None, None], axis=0)
-                    dx[:, :, i:i+self.filter_size, j:j+self.filter_size] += \
-                        self.filters[k] * dout[:, k, i, j][:, None, None, None]
-        
-        # Update with momentum
-        self.v = self.momentum * self.v - self.learning_rate * dw
-        self.filters += self.v
-        
-        # Add memory cleanup
-        if self.use_gpu and self.memory_cleanup_counter % 2 == 0:
-            clear_gpu_memory(100)
-        self.memory_cleanup_counter += 1
-        
-        return dx
 
     def _backward_direct(self, dout):
         """Direct backward pass implementation"""
