@@ -126,6 +126,7 @@ class ConvLayer:
         self.min_fft_size = 32  # Minimum size for using FFT
         self.memory_cleanup_counter = 0
 
+        self.padding = padding  # Store the padding type
         self.stride = stride  # Ensure stride is an integer
         self.stride_tuple = (stride, stride)  # Tuple for cuDNN functions
         
@@ -267,6 +268,7 @@ class ConvLayer:
         output_height = ((height + 2 * self.pad_h - self.filter_size) // self.stride) + 1
         output_width = ((width + 2 * self.pad_w - self.filter_size) // self.stride) + 1
         
+        # Padding logic
         if self.padding == 'same':
             padded_inputs = self.xp.pad(
                 inputs,

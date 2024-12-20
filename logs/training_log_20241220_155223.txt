@@ -1,0 +1,1 @@
+[2024-12-20 15:52:26] Training failed: 'ConvLayer' object has no attribute 'padding'
