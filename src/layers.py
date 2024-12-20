@@ -150,20 +150,7 @@ class ConvLayer:
             except:
                 pass
 
-        self.use_cudnn = False
-        if GPU_AVAILABLE:
-            try:
-                self.use_cudnn = hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available
-                if self.use_cudnn:
-                    # Create cuDNN handle only when needed
-                    self.cudnn_handle = None
-                    self.conv_desc = None
-                    self.x_desc = None
-                    self.w_desc = None
-                    self.y_desc = None
-            except Exception as e:
-                print(f"cuDNN initialization warning: {e}")
-                self.use_cudnn = False
+        self.use_cudnn = False  # Disable cuDNN by default
         
         # Initialize filters with zeros to prevent None
         self.filters = None
@@ -173,6 +160,21 @@ class ConvLayer:
         self.in_channels = None
         self.input_height = None
         self.input_width = None
+
+        # Initialize cuDNN support
+        self.use_cudnn = False
+        if GPU_AVAILABLE and hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available:
+            try:
+                self.use_cudnn = True
+                self.cudnn_handle = cp.cuda.cudnn.get_default_handle()
+                # Descriptors will be initialized in forward pass
+                self.x_desc = None
+                self.w_desc = None
+                self.conv_desc = None
+                self.y_desc = None
+            except Exception as e:
+                print(f"cuDNN initialization warning: {e}")
+                self.use_cudnn = False
     
     def _initialize_params(self, input_shape):
         """Initialize filters based on input shape"""
@@ -198,36 +200,41 @@ class ConvLayer:
         if not self.use_cudnn:
             return
             
-        if self.cudnn_handle is None:
-            self.cudnn_handle = cudnn.create()
+        try:
+            N, C, H, W = x_shape
             
-        N, C, H, W = x_shape
-        self.x_desc = cudnn.create_tensor_descriptor()
-        self.w_desc = cudnn.create_filter_descriptor()
-        self.conv_desc = cudnn.create_convolution_descriptor()
-        
-        cudnn.set_tensor4d_descriptor(
-            self.x_desc,
-            cudnn.CUDNN_DATA_FLOAT,
-            N, C, H, W
-        )
-        
-        cudnn.set_filter4d_descriptor(
-            self.w_desc,
-            cudnn.CUDNN_DATA_FLOAT,
-            self.num_filters, C, 
-            self.filter_size, self.filter_size
-        )
-        
-        cudnn.set_convolution2d_descriptor(
-            self.conv_desc,
-            self.pad_h, self.pad_w,  # padding
-            self.stride, self.stride,  # stride
-            1, 1,  # dilation
-            cudnn.CUDNN_CROSS_CORRELATION,
-            cudnn.CUDNN_DATA_FLOAT
-        )
-        
+            # Create tensor descriptors
+            self.x_desc = cp.cuda.cudnn.create_tensor_descriptor()
+            self.w_desc = cp.cuda.cudnn.create_filter_descriptor()
+            self.conv_desc = cp.cuda.cudnn.create_convolution_descriptor()
+            
+            # Set descriptor configurations
+            cp.cuda.cudnn.set_tensor4d_descriptor(
+                self.x_desc,
+                cp.cuda.cudnn.CUDNN_DATA_FLOAT,
+                N, C, H, W
+            )
+            
+            cp.cuda.cudnn.set_filter4d_descriptor(
+                self.w_desc,
+                cp.cuda.cudnn.CUDNN_DATA_FLOAT,
+                self.num_filters, C,
+                self.filter_size, self.filter_size
+            )
+            
+            cp.cuda.cudnn.set_convolution2d_descriptor(
+                self.conv_desc,
+                self.pad_h, self.pad_w,
+                self.stride, self.stride,
+                1, 1,  # dilation
+                cp.cuda.cudnn.CUDNN_CROSS_CORRELATION,
+                cp.cuda.cudnn.CUDNN_DATA_FLOAT
+            )
+            
+        except Exception as e:
+            print(f"Error initializing cuDNN descriptors: {e}")
+            self.use_cudnn = False
+
     def forward(self, inputs):
         try:
             inputs = to_gpu(inputs)
@@ -239,18 +246,53 @@ class ConvLayer:
             if self.filters is None:
                 raise ValueError("Filters not properly initialized")
                 
-            # Choose forward implementation
+            # Try cuDNN first if available
             if self.use_cudnn:
                 try:
                     return self._forward_cudnn(inputs)
                 except Exception as e:
                     print(f"cuDNN forward failed: {e}, falling back to direct")
             
+            # Use direct convolution instead of cuDNN
             return self._forward_direct(inputs)
             
         except Exception as e:
             print(f"Error in ConvLayer forward pass: {e}")
             raise
+
+    def _forward_direct(self, inputs):
+        """Direct convolution implementation"""
+        batch_size, channels, height, width = inputs.shape
+        output_height = ((height + 2 * self.pad_h - self.filter_size) // self.stride) + 1
+        output_width = ((width + 2 * self.pad_w - self.filter_size) // self.stride) + 1
+        
+        if self.padding == 'same':
+            padded_inputs = self.xp.pad(
+                inputs,
+                ((0,0), (0,0), (self.pad_h,self.pad_h), (self.pad_w,self.pad_w)),
+                'constant'
+            )
+        else:
+            padded_inputs = inputs
+            
+        output = self.xp.zeros((batch_size, self.num_filters, output_height, output_width))
+        
+        # Optimized direct convolution
+        for i in range(output_height):
+            for j in range(output_width):
+                h_start = i * self.stride
+                h_end = h_start + self.filter_size
+                w_start = j * self.stride
+                w_end = w_start + self.filter_size
+                
+                input_slice = padded_inputs[:, :, h_start:h_end, w_start:w_end]
+                for k in range(self.num_filters):
+                    output[:, k, i, j] = self.xp.sum(
+                        input_slice * self.filters[k, :, :, :], 
+                        axis=(1,2,3)
+                    )
+        
+        return output
 
     def _forward_implementation(self, inputs):
         # Validate input shape
@@ -281,14 +323,6 @@ class ConvLayer:
         except Exception as e:
             print(f"Forward pass failed: {e}")
             return self._forward_direct(inputs)
-
-        if self.use_cudnn:
-            try:
-                return self._forward_cudnn(inputs)
-            except Exception as e:
-                print(f"cuDNN forward failed, falling back to direct: {e}")
-                
-        return self._forward_direct(inputs)
 
     def _forward_fft(self, inputs):
         """FFT-based convolution with fixed shape handling"""
@@ -354,20 +388,6 @@ class ConvLayer:
                 cp.get_default_memory_pool().free_all_blocks()
             return self._forward_direct(inputs)
 
-    def _forward_direct(self, inputs):
-        """Direct convolution as fallback"""
-        output_height = inputs.shape[2] - self.filter_size + 1
-        output_width = inputs.shape[3] - self.filter_size + 1
-        output = self.xp.zeros((inputs.shape[0], self.num_filters, output_height, output_width))
-        
-        for i in range(output_height):
-            for j in range(output_width):
-                input_slice = inputs[:, :, i:i+self.filter_size, j:j+self.filter_size]
-                for k in range(self.num_filters):
-                    output[:, k, i, j] = self.xp.sum(input_slice * self.filters[k], axis=(1,2,3))
-        
-        return output
-
     def _forward_chunked(self, inputs):
         """Process large batches in memory-efficient chunks"""
         outputs = []
@@ -401,110 +421,11 @@ class ConvLayer:
             
         return output
 
-    def _forward_cudnn(self, x):
-        """Forward pass using cuDNN"""
-        if self.x_desc is None:
-            self._init_cudnn_descriptors(x.shape)
-            
-        # Get output dimensions
-        _, _, out_h, out_w = cudnn.get_convolution2d_forward_output_dim(
-            self.conv_desc,
-            self.x_desc,
-            self.w_desc
-        )
-        
-        # Create output descriptor
-        y = cp.empty((x.shape[0], self.num_filters, out_h, out_w), dtype=np.float32)
-        self.y_desc = cudnn.create_tensor_descriptor()
-        cudnn.set_tensor4d_descriptor(
-            self.y_desc,
-            cudnn.CUDNN_DATA_FLOAT,
-            y.shape[0], y.shape[1], y.shape[2], y.shape[3]
-        )
-        
-        # Get algorithm
-        algo = cudnn.get_convolution_forward_algorithm(
-            self.cudnn_handle,
-            self.x_desc,
-            self.w_desc,
-            self.conv_desc,
-            self.y_desc,
-            cudnn.CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
-            0
-        )
-        
-        # Get workspace size
-        workspace_size = cudnn.get_convolution_forward_workspace_size(
-            self.cudnn_handle,
-            self.x_desc,
-            self.w_desc,
-            self.conv_desc,
-            self.y_desc,
-            algo
-        )
-        
-        workspace = cp.empty((workspace_size,), dtype=np.uint8)
-        
-        # Perform convolution
-        alpha = 1.0
-        beta = 0.0
-        cudnn.convolution_forward(
-            self.cudnn_handle,
-            alpha,
-            self.x_desc, x.astype(np.float32),
-            self.w_desc, self.filters.astype(np.float32),
-            self.conv_desc,
-            algo,
-            workspace,
-            workspace_size,
-            beta,
-            self.y_desc, y
-        )
-        
-        return y
-
-    def _backward_cudnn(self, dout):
-        """Backward pass using cuDNN"""
-        if not self.use_cudnn:
-            return self._backward_direct(dout)
-            
-        try:
-            # Data gradient
-            dx = cp.empty_like(self.inputs)
-            cudnn.convolution_backward_data(
-                1.0,  # alpha
-                self.w_desc, self.filters,
-                self.y_desc, dout,
-                self.conv_desc,
-                0.0,  # beta
-                self.x_desc, dx
-            )
-            
-            # Filter gradient
-            dw = cp.empty_like(self.filters)
-            cudnn.convolution_backward_filter(
-                1.0,  # alpha
-                self.x_desc, self.inputs,
-                self.y_desc, dout,
-                self.conv_desc,
-                0.0,  # beta
-                self.w_desc, dw
-            )
-            
-            return dx, dw
-            
-        except Exception as e:
-            print(f"cuDNN backward failed: {e}, falling back to direct")
-            return self._backward_direct(dout)
-
     def backward(self, dout):
         dout = to_gpu(dout)
         
         try:
-            if self.use_cudnn:
-                dx, dw = self._backward_cudnn(dout)
-            else:
-                dx, dw = self._backward_direct(dout)
+            dx, dw = self._backward_direct(dout)
                 
             # Gradient clipping
             clip_threshold = 5.0
