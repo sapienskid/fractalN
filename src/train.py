@@ -72,7 +72,7 @@ def create_data_generators():
         seed=42,
         color_mode='rgb',
         interpolation='bilinear'
-    )
+    ).repeat()  # Add repeat() to prevent data exhaustion
 
     validation_generator = test_datagen.flow_from_directory(
         'data/test',  # Using test data for validation
@@ -81,7 +81,7 @@ def create_data_generators():
         class_mode='binary',
         shuffle=False,  # No need to shuffle validation data
         color_mode='rgb'
-    )
+    ).repeat()  # Add repeat() to prevent data exhaustion
 
     # Print class distribution
     print("\nClass distribution in generators:")
@@ -140,10 +140,21 @@ def train_model():
     
     train_generator, validation_generator = create_data_generators()
     
-    # Calculate steps
+    # Calculate steps correctly
     steps_per_epoch = train_generator.samples // BATCH_SIZE
     validation_steps = validation_generator.samples // BATCH_SIZE
-    
+
+    # Ensure steps are at least 1
+    steps_per_epoch = max(1, steps_per_epoch)
+    validation_steps = max(1, validation_steps)
+
+    print(f"\nTraining configuration:")
+    print(f"Steps per epoch: {steps_per_epoch}")
+    print(f"Validation steps: {validation_steps}")
+    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Training samples: {train_generator.samples}")
+    print(f"Validation samples: {validation_generator.samples}")
+
     # Create model
     inputs = tf.keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
     model = create_model(inputs)
@@ -187,25 +198,31 @@ def train_model():
         ]
     )
 
-    # Add learning rate scheduler callback instead of custom schedule
+    # Update callbacks to monitor both metrics
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
             monitor='val_loss',
             patience=10,
-            restore_best_weights=True
+            restore_best_weights=True,
+            verbose=1
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss',
             factor=0.2,
             patience=5,
-            min_lr=1e-6
+            min_lr=1e-6,
+            verbose=1
         ),
         tf.keras.callbacks.ModelCheckpoint(
             'best_model.keras',
             monitor='val_accuracy',
             save_best_only=True,
-            mode='max'
+            mode='max',
+            verbose=1
         ),
+        # Add progress logging callback
+        tf.keras.callbacks.CSVLogger('training_log.csv'),
+        # Add memory cleanup callback
         tf.keras.callbacks.LambdaCallback(
             on_epoch_end=lambda epoch, logs: gc.collect()
         )
@@ -218,7 +235,10 @@ def train_model():
         steps_per_epoch=steps_per_epoch,
         validation_data=validation_generator,
         validation_steps=validation_steps,
-        callbacks=callbacks
+        callbacks=callbacks,
+        verbose=1,
+        workers=1,
+        use_multiprocessing=False  # Disable multiprocessing to prevent data issues
     )
 
     # Final evaluation
