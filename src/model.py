@@ -110,28 +110,20 @@ class CNN:
         # Initialize GPU configuration
         self.gpu_config = self._init_gpu_config()
         
-        # Initialize basic parameters
-        input_size = 224  # Input image size
-        c1_out = ((input_size - 2) // 2)
-        c2_out = ((c1_out - 2) // 2)
-        c3_out = ((c2_out - 2) // 2)
-        flattened_size = 128 * c3_out * c3_out
-
         # Use GPU configuration for optimization settings
         if self.gpu_config and self.use_gpu:
             self.batch_size = self.gpu_config['optimal_batch_size']
             self.enable_parallel = self.gpu_config['is_high_memory']
-            self.enable_chunk_processing = not self.gpu_config['is_high_memory']  # Added this line
+            self.enable_chunk_processing = not self.gpu_config['is_high_memory']
             self.memory_threshold = 2000 if self.gpu_config['is_high_memory'] else 500
             self.cleanup_frequency = 10 if self.gpu_config['is_high_memory'] else 2
         else:
-            # Default settings for CPU or unknown GPU
             self.batch_size = 4
             self.enable_parallel = False
             self.enable_chunk_processing = True
             self.memory_threshold = 500
             self.cleanup_frequency = 2
-
+        
         # Initialize memory counter
         self.memory_cleanup_counter = 0
         

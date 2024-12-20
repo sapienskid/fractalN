@@ -5,10 +5,10 @@ from gpu_utils import GPU_AVAILABLE, to_gpu, to_cpu, clear_gpu_memory
 from exceptions import (
     ValidationError, ShapeError, GPUError, 
     LayerError, MemoryError, GPUMemoryTracker,
-    validate_conv_params,  # Add this import
-    validate_shapes_for_matmul,  # Add this if you need matrix multiplication validation
-    check_gpu_memory,  # Add this if you need memory checks
-    validate_input  # Add this if you need input validation
+    validate_conv_params,
+    validate_shapes_for_matmul,
+    check_gpu_memory,
+    validate_input
 )
 
 class BatchNormLayer:
