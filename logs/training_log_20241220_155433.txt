@@ -1,1 +1,0 @@
-[2024-12-20 16:07:34] Training failed: operands could not be broadcast together with shapes (3, 3, 3) (3, 3, 2) (3, 3, 3)

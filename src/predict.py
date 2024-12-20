@@ -1,78 +1,67 @@
-import os
-import cv2
+import tensorflow as tf
 import numpy as np
-from model import CNN
-from colorama import Fore, Style
 from PIL import Image
+import sys
 
-def preprocess_image(image_path):
-    """Preprocess a single image for prediction"""
-    # Load and resize image to match training size (224x224)
-    img = Image.open(image_path)
-    img = img.resize((224, 224))
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
-    
-    # Convert to numpy array and normalize
-    img_array = np.array(img)
-    img_array = np.transpose(img_array, (2, 0, 1))  # CHW format
-    img_array = img_array / 255.0  # Normalize
-    
-    return np.expand_dims(img_array, axis=0)  # Add batch dimension
+def load_and_prep_image(image_path):
+    # Read JPEG file
+    raw_img = tf.io.read_file(image_path)
+    # Decode JPEG
+    img = tf.io.decode_jpeg(raw_img, channels=3)
+    # Resize
+    img = tf.image.resize(img, [224, 224], method='bilinear')
+    # Convert to float32 and normalize
+    img = tf.cast(img, tf.float32) / 255.0
+    # Add batch dimension
+    img = tf.expand_dims(img, 0)
+    return img
 
-def predict_single_image(image_path, model_path="models/saved_models/best_model"):
-    """Make prediction on a single mushroom image"""
-    try:
-        # Load and initialize model
-        model = CNN()
-        model.load(model_path)
-        
-        # Preprocess image
-        img = preprocess_image(image_path)
-        
-        # Make prediction
-        predictions = model.forward(img)
-        class_index = np.argmax(predictions[0])
-        confidence = float(predictions[0][class_index])
-        
-        # Format results
-        result = {
-            'class': "Edible" if class_index == 0 else "Poisonous",
-            'confidence': confidence,
-            'probabilities': {
-                'Edible': float(predictions[0][0]),
-                'Poisonous': float(predictions[0][1])
-            }
-        }
-        
-        # Print results
-        print(f"\n{Fore.CYAN}{'='*50}")
-        print(f"{Fore.WHITE}Mushroom Classification Results")
-        print(f"{Fore.CYAN}{'='*50}")
-        print(f"\n{Fore.WHITE}Image: {Fore.YELLOW}{os.path.basename(image_path)}")
-        print(f"\n{Fore.WHITE}Classification: {Fore.GREEN if result['class'] == 'Edible' else Fore.RED}{result['class']}")
-        print(f"{Fore.WHITE}Confidence: {Fore.YELLOW}{confidence:.2%}")
-        print(f"\n{Fore.WHITE}Detailed Probabilities:")
-        print(f"{Fore.GREEN}Edible: {result['probabilities']['Edible']:.2%}")
-        print(f"{Fore.RED}Poisonous: {result['probabilities']['Poisonous']:.2%}")
-        
-        # Warning for low confidence predictions
-        if confidence < 0.8:
-            print(f"\n{Fore.YELLOW}Warning: Low confidence prediction!")
-            print(f"Please consult an expert mycologist for verification.{Style.RESET_ALL}")
-        
-        return result
-        
-    except Exception as e:
-        print(f"{Fore.RED}Error making prediction: {str(e)}{Style.RESET_ALL}")
-        return None
+def predict_mushroom(model_path, image_path):
+    # Update model path to use .keras extension
+    model = tf.keras.models.load_model(model_path.replace('.h5', '.keras'))
+    
+    # Prepare the image
+    processed_image = load_and_prep_image(image_path)
+    
+    # Make prediction with adjusted threshold
+    prediction = model.predict(processed_image)
+    
+    # Use standard threshold since data is balanced
+    THRESHOLD = 0.5
+    
+    # Interpret results
+    if prediction[0][0] > THRESHOLD:
+        return "Poisonous", prediction[0][0]
+    else:
+        return "Edible", 1 - prediction[0][0]
+
+def analyze_prediction_confidence(prediction):
+    """Helper function to provide more detailed analysis"""
+    raw_score = prediction[0][0]
+    if raw_score > 0.8:
+        confidence_level = "Very High"
+    elif raw_score > 0.6:
+        confidence_level = "High"
+    elif raw_score > 0.4:
+        confidence_level = "Moderate"
+    else:
+        confidence_level = "Low"
+    return confidence_level
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description='Predict if a mushroom is edible or poisonous')
-    parser.add_argument('image_path', help='Path to the mushroom image')
-    parser.add_argument('--model', default='models/saved_models/best_model', 
-                      help='Path to the trained model')
+    if len(sys.argv) != 2:
+        print("Usage: python predict.py <image_path>")
+        print("Note: Image should be in JPEG format")
+        sys.exit(1)
     
-    args = parser.parse_args()
-    predict_single_image(args.image_path, args.model)
+    if not sys.argv[1].lower().endswith(('.jpg', '.jpeg')):
+        print("Warning: Image file should be in JPEG format")
+    
+    result, confidence = predict_mushroom('mushroom_classifier.keras', sys.argv[1])
+    confidence_level = analyze_prediction_confidence(confidence)
+    print(f"Prediction: {result}")
+    print(f"Confidence: {confidence:.2%}")
+    print(f"Confidence Level: {confidence_level}")
+    
+    if confidence < 0.7:
+        print("\nWarning: Low confidence prediction. Please seek expert verification.")

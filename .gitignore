@@ -28,7 +28,7 @@ wheels/
 .idea/
 venv/
 .vscode-upload.json
-
+.venv/
 
 # OS
 .DS_Store
