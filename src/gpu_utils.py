@@ -29,44 +29,78 @@ def get_gpu_info():
         print(f"Error getting GPU info: {e}")
         return None
 
-def configure_gpu():
-    """Configure GPU for high performance with 15GB memory"""
+def is_high_memory_gpu():
+    """Detect if running on a high-memory GPU (>=12GB)"""
     if not GPU_AVAILABLE:
         return False
+    try:
+        device = cp.cuda.Device(0)
+        total_mem_gb = device.mem_info[1] / (1024**3)
+        return total_mem_gb >= 12
+    except:
+        return False
 
+def get_gpu_config():
+    """Get GPU configuration without setting up memory pool"""
+    if not GPU_AVAILABLE:
+        return None
+        
     try:
         device = cp.cuda.Device(0)
         total_mem_gb = device.mem_info[1] / (1024**3)
         
-        if total_mem_gb >= 12:  # High memory GPU
-            # Use 80% of available memory for pool
-            pool_size = int(0.8 * total_mem_gb * 1024**3)
-            # Enable high performance settings
-            cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
-            cp.cuda.cudnn.set_enabled(True)  # Enable cuDNN if available
-            
-            # Set stream preferences for parallel execution
-            cp.cuda.Stream.null.use()
-            cp.random.seed(None)
-        else:
-            # Configure smaller memory pool for 4GB GPU
-            if total_mem_gb < 6:
-                pool_size = 3 * 1024 * 1024 * 1024  # 3GB pool
-            else:
-                pool_size = 12 * 1024 * 1024 * 1024  # 12GB pool
-            
-            cp.cuda.set_allocator(cp.cuda.MemoryPool(cp.cuda.malloc_managed).malloc)
-            cp.cuda.set_pinned_memory_allocator(cp.cuda.PinnedMemoryPool().malloc)
+        return {
+            'is_high_memory': total_mem_gb >= 12,
+            'total_memory': total_mem_gb,
+            'optimal_batch_size': 64 if total_mem_gb >= 12 else 4,
+            'pool_size': int(0.8 * total_mem_gb * 1024**3),
+            'enable_parallel': total_mem_gb >= 12
+        }
+    except:
+        return None
+
+def configure_gpu():
+    """Configure GPU and return status and config"""
+    if not GPU_AVAILABLE:
+        return False, None
+
+    try:
+        gpu_config = get_gpu_config()
+        if gpu_config is None:
+            return False, None
+
+        device = cp.cuda.Device(0)
+        
+        # Configure memory pool
+        cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
+        
+        # Configure cuDNN if available
+        if hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available:
+            try:
+                # Enable cuDNN autotuning
+                cp.cuda.runtime.setDeviceFlags(cp.cuda.runtime.cudaDeviceMapHost)
+                # Note: newer versions of CuPy handle cuDNN enablement automatically
+                
+                # Get cuDNN version
+                cudnn_version = cp.cuda.cudnn.getVersion()
+                print(f"cuDNN Version: {cudnn_version}")
+                gpu_config['cudnn_version'] = cudnn_version
+            except Exception as e:
+                print(f"cuDNN configuration warning: {e}")
         
         device.use()
-        print(f"\nGPU Configuration (High Performance):")
-        print(f"Total Memory: {total_mem_gb:.1f}GB")
-        print(f"Pool Size: {pool_size/1024**3:.1f}GB")
-        return True
+        
+        print(f"\nGPU Configuration:")
+        print(f"Total Memory: {gpu_config['total_memory']:.1f}GB")
+        print(f"Mode: {'High Memory' if gpu_config['is_high_memory'] else 'Low Memory'}")
+        print(f"Optimal Batch Size: {gpu_config['optimal_batch_size']}")
+        print(f"cuDNN Available: {hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available}")
+        
+        return True, gpu_config
 
     except Exception as e:
         print(f"Error configuring GPU: {e}")
-        return False
+        return False, None
 
 def to_gpu(x):
     """Transfer numpy array to GPU if available"""

@@ -2,6 +2,7 @@ import numpy as np
 import cupy as cp
 import os
 from gpu_utils import GPU_AVAILABLE, to_gpu, to_cpu, clear_gpu_memory
+import cupy.cuda.cudnn as cudnn
 
 class BatchNormLayer:
     def __init__(self, num_features):
@@ -107,6 +108,36 @@ class ConvLayer:
         self.chunk_size = 32  # Larger chunks for more memory
         self.min_fft_size = 32  # Minimum size for using FFT
         self.memory_cleanup_counter = 0
+
+        # Check GPU memory capacity
+        self.is_high_memory = False
+        if self.use_gpu:
+            try:
+                device = cp.cuda.Device(0)
+                total_mem_gb = device.mem_info[1] / (1024**3)
+                self.is_high_memory = total_mem_gb >= 12
+                
+                # Configure based on memory
+                self.use_fft = self.is_high_memory
+                self.parallel_channels = self.is_high_memory
+                self.chunk_size = 32 if self.is_high_memory else 2
+            except:
+                pass
+
+        self.use_cudnn = False
+        if GPU_AVAILABLE:
+            try:
+                self.use_cudnn = hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available
+                if self.use_cudnn:
+                    # Create cuDNN handle only when needed
+                    self.cudnn_handle = None
+                    self.conv_desc = None
+                    self.x_desc = None
+                    self.w_desc = None
+                    self.y_desc = None
+            except Exception as e:
+                print(f"cuDNN initialization warning: {e}")
+                self.use_cudnn = False
     
     def _initialize_params(self, input_shape):
         """Initialize filters based on input shape"""
@@ -126,6 +157,41 @@ class ConvLayer:
             ) / scale)
             self.v = to_gpu(np.zeros_like(self.filters))
             self.initialized = True
+
+    def _init_cudnn_descriptors(self, x_shape):
+        """Initialize cuDNN descriptors"""
+        if not self.use_cudnn:
+            return
+            
+        if self.cudnn_handle is None:
+            self.cudnn_handle = cudnn.create()
+            
+        N, C, H, W = x_shape
+        self.x_desc = cudnn.create_tensor_descriptor()
+        self.w_desc = cudnn.create_filter_descriptor()
+        self.conv_desc = cudnn.create_convolution_descriptor()
+        
+        cudnn.set_tensor4d_descriptor(
+            self.x_desc,
+            cudnn.CUDNN_DATA_FLOAT,
+            N, C, H, W
+        )
+        
+        cudnn.set_filter4d_descriptor(
+            self.w_desc,
+            cudnn.CUDNN_DATA_FLOAT,
+            self.num_filters, C, 
+            self.filter_size, self.filter_size
+        )
+        
+        cudnn.set_convolution2d_descriptor(
+            self.conv_desc,
+            0, 0,  # padding
+            1, 1,  # stride
+            1, 1,  # dilation
+            cudnn.CUDNN_CROSS_CORRELATION,
+            cudnn.CUDNN_DATA_FLOAT
+        )
         
     def forward(self, inputs):
         inputs = to_gpu(inputs)
@@ -140,17 +206,23 @@ class ConvLayer:
             
         # Choose convolution method
         try:
-            if self.use_gpu and hasattr(cp, 'cuda') and cp.cuda.get_device_id() is not None:
-                mem_info = cp.cuda.Device().mem_info
-                total_gb = mem_info[1] / (1024**3)
-                
-                if total_gb >= 12:  # High memory GPU
-                    return self._forward_parallel(inputs)
+            if self.is_high_memory and self.use_gpu:
+                return self._forward_parallel(inputs)
+            elif inputs.shape[0] > self.chunk_size and self.use_gpu:
+                return self._forward_chunked(inputs)
             return self._forward_direct(inputs)
         except Exception as e:
             print(f"Forward pass failed: {e}")
-            raise e
-    
+            return self._forward_direct(inputs)
+
+        if self.use_cudnn:
+            try:
+                return self._forward_cudnn(inputs)
+            except Exception as e:
+                print(f"cuDNN forward failed, falling back to direct: {e}")
+                
+        return self._forward_direct(inputs)
+
     def _forward_fft(self, inputs):
         """FFT-based convolution with fixed shape handling"""
         xp = self.xp
@@ -262,6 +334,68 @@ class ConvLayer:
             
         return output
 
+    def _forward_cudnn(self, x):
+        """Forward pass using cuDNN"""
+        if self.x_desc is None:
+            self._init_cudnn_descriptors(x.shape)
+            
+        # Get output dimensions
+        _, _, out_h, out_w = cudnn.get_convolution2d_forward_output_dim(
+            self.conv_desc,
+            self.x_desc,
+            self.w_desc
+        )
+        
+        # Create output descriptor
+        y = cp.empty((x.shape[0], self.num_filters, out_h, out_w), dtype=np.float32)
+        self.y_desc = cudnn.create_tensor_descriptor()
+        cudnn.set_tensor4d_descriptor(
+            self.y_desc,
+            cudnn.CUDNN_DATA_FLOAT,
+            y.shape[0], y.shape[1], y.shape[2], y.shape[3]
+        )
+        
+        # Get algorithm
+        algo = cudnn.get_convolution_forward_algorithm(
+            self.cudnn_handle,
+            self.x_desc,
+            self.w_desc,
+            self.conv_desc,
+            self.y_desc,
+            cudnn.CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
+            0
+        )
+        
+        # Get workspace size
+        workspace_size = cudnn.get_convolution_forward_workspace_size(
+            self.cudnn_handle,
+            self.x_desc,
+            self.w_desc,
+            self.conv_desc,
+            self.y_desc,
+            algo
+        )
+        
+        workspace = cp.empty((workspace_size,), dtype=np.uint8)
+        
+        # Perform convolution
+        alpha = 1.0
+        beta = 0.0
+        cudnn.convolution_forward(
+            self.cudnn_handle,
+            alpha,
+            self.x_desc, x.astype(np.float32),
+            self.w_desc, self.filters.astype(np.float32),
+            self.conv_desc,
+            algo,
+            workspace,
+            workspace_size,
+            beta,
+            self.y_desc, y
+        )
+        
+        return y
+
     def backward(self, dout):
         dout = to_gpu(dout)
         dx = self.xp.zeros_like(self.inputs)
@@ -303,6 +437,15 @@ class ConvLayer:
             self.initialized = True
         except Exception as e:
             print(f"Error loading ConvLayer parameters: {e}")
+
+    def __del__(self):
+        """Cleanup cuDNN resources"""
+        if hasattr(self, 'use_cudnn') and self.use_cudnn:
+            for desc in [self.x_desc, self.w_desc, self.y_desc, self.conv_desc]:
+                if desc is not None:
+                    cudnn.destroy_tensor_descriptor(desc)
+            if hasattr(self, 'cudnn_handle'):
+                cudnn.destroy(self.cudnn_handle)
 
 class MaxPoolLayer:
     def __init__(self, pool_size=2):
@@ -538,6 +681,20 @@ class Dropout:
                 self.mask = to_gpu(np.load(mask_path))
         except Exception as e:
             print(f"Error loading Dropout parameters: {e}")
+
+class Flatten:
+    def __init__(self):
+        self.use_gpu = hasattr(cp, 'cuda') and cp.cuda.is_available()
+        self.xp = cp if self.use_gpu else np
+        
+    def forward(self, x):
+        x = self.to_device(x)
+        self.input_shape = x.shape
+        # Ensure proper flattening
+        return x.reshape(x.shape[0], -1)
+    
+    def backward(self, grad):
+        return grad.reshape(self.input_shape)
 
 def relu(x):
     return np.maximum(0, x)

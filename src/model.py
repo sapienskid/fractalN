@@ -7,7 +7,14 @@ except ImportError:
     GPU_AVAILABLE = False
 from layers import ConvLayer, MaxPoolLayer, FCLayer, relu, softmax, BatchNormLayer
 import os
-from gpu_utils import GPU_AVAILABLE, to_gpu, to_cpu, clear_gpu_memory
+from gpu_utils import (
+    GPU_AVAILABLE, 
+    to_gpu, 
+    to_cpu, 
+    clear_gpu_memory, 
+    configure_gpu,
+    is_high_memory_gpu
+)
 
 class ReLU:
     def __init__(self):
@@ -67,11 +74,19 @@ class Dropout:
         pass
 
 def cross_entropy_loss(predictions, targets):
-    """Calculate cross entropy loss ensuring consistent array types"""
+    """Calculate cross entropy loss ensuring consistent array types and shapes"""
     xp = cp if GPU_AVAILABLE else np
     predictions = to_gpu(predictions)
     targets = to_gpu(targets)
     
+    # Ensure predictions have correct shape (batch_size, num_classes)
+    if len(predictions.shape) > 2:
+        predictions = predictions.reshape(predictions.shape[0], -1)
+    
+    # Ensure targets have correct shape (batch_size, num_classes)
+    if len(targets.shape) > 2:
+        targets = targets.reshape(targets.shape[0], -1)
+        
     epsilon = 1e-7
     predictions = xp.clip(predictions, epsilon, 1-epsilon)
     return float(to_cpu(-xp.mean(xp.sum(targets * xp.log(predictions), axis=1))))
@@ -90,12 +105,34 @@ class CNN:
     def __init__(self):
         self.use_gpu = GPU_AVAILABLE
         self.xp = cp if self.use_gpu else np
-        # Calculate sizes for proper layer connections
+        
+        # Initialize GPU configuration
+        self.gpu_config = self._init_gpu_config()
+        
+        # Initialize basic parameters
         input_size = 224  # Input image size
-        c1_out = ((input_size - 2) // 2)  # After first conv and pool
-        c2_out = ((c1_out - 2) // 2)      # After second conv and pool
-        c3_out = ((c2_out - 2) // 2)      # After third conv and pool
-        flattened_size = 128 * c3_out * c3_out  # For fully connected layer
+        c1_out = ((input_size - 2) // 2)
+        c2_out = ((c1_out - 2) // 2)
+        c3_out = ((c2_out - 2) // 2)
+        flattened_size = 128 * c3_out * c3_out
+
+        # Use GPU configuration for optimization settings
+        if self.gpu_config and self.use_gpu:
+            self.batch_size = self.gpu_config['optimal_batch_size']
+            self.enable_parallel = self.gpu_config['is_high_memory']
+            self.enable_chunk_processing = not self.gpu_config['is_high_memory']  # Added this line
+            self.memory_threshold = 2000 if self.gpu_config['is_high_memory'] else 500
+            self.cleanup_frequency = 10 if self.gpu_config['is_high_memory'] else 2
+        else:
+            # Default settings for CPU or unknown GPU
+            self.batch_size = 4
+            self.enable_parallel = False
+            self.enable_chunk_processing = True
+            self.memory_threshold = 500
+            self.cleanup_frequency = 2
+
+        # Initialize memory counter
+        self.memory_cleanup_counter = 0
         
         # Initialize layers
         self.layers = [
@@ -114,91 +151,73 @@ class CNN:
             ReLU(),
             MaxPoolLayer(2),
             
-            Flatten(),
-            FCLayer(flattened_size, 512),  # Adjust size based on your input dimensions
+            Flatten(),  # This is crucial for reshaping
+            FCLayer(flattened_size, 512),
             BatchNormLayer(512),
             ReLU(),
             Dropout(0.5),
-            FCLayer(512, 2)
+            FCLayer(512, 2)  # Output layer with 2 classes
         ]
-        
-        # Initialize other parameters
-        self.learning_rate = 0.001
-        self.lr_decay = 0.95
-        self.epoch_count = 0
-        self.train_mode = True
-        self.memory_cleanup_counter = 0
-        self.enable_gpu_optimizations = True
-        
-        # Adjust batch size based on available GPU memory
-        if GPU_AVAILABLE:
-            device = cp.cuda.Device(0)
-            total_mem_gb = device.mem_info[1] / (1024**3)
+
+    def _init_gpu_config(self):
+        """Initialize GPU configuration"""
+        if not self.use_gpu:
+            return {
+                'is_high_memory': False,
+                'optimal_batch_size': 4,
+                'enable_parallel': False
+            }
             
-            if total_mem_gb >= 12:  # High memory GPU optimizations
-                self.batch_size = 64  # Larger batch size
-                self.enable_parallel = True
-                self.memory_threshold = 2000  # Higher threshold (2GB)
-                self.cleanup_frequency = 10   # Less frequent cleanup
-                
-                # Enable performance optimizations
-                for layer in self.layers:
-                    if isinstance(layer, ConvLayer):
-                        layer.use_fft = True
-                        layer.parallel_channels = True
-                        layer.chunk_size = 32
-            else:
-                # Use smaller batch size for limited GPU memory
-                self.batch_size = 4 if total_mem_gb < 6 else 32
-                self.enable_chunk_processing = total_mem_gb < 6
-        else:
-            self.batch_size = 32
-            self.enable_chunk_processing = False
-        
-        self.memory_threshold = 500  # MB (lower threshold for 4GB GPU)
-        self.cleanup_frequency = 2    # More frequent cleanup
+        try:
+            _, gpu_config = configure_gpu()
+            if gpu_config is None:
+                raise ValueError("GPU configuration failed")
+            return gpu_config
+        except Exception as e:
+            print(f"Warning: Could not configure GPU optimally: {e}")
+            return {
+                'is_high_memory': False,
+                'optimal_batch_size': 4,
+                'enable_parallel': False
+            }
 
     def forward(self, x, training=False):
         try:
             x = to_gpu(x)
-            if self.enable_gpu_optimizations:
-                # Process in smaller chunks if needed
-                if x.shape[0] > self.batch_size:
-                    return self._forward_in_chunks(x, training)
             
-            out = x
-            total_layers = len(self.layers)
-            for i, layer in enumerate(self.layers):
-                # Get layer info for progress monitoring
-                layer_name = layer.__class__.__name__
-                layer_info = {
-                    'name': layer_name,
-                    'index': i + 1,
-                    'total': total_layers,
-                    'progress': (i + 1) / total_layers * 100
-                }
-                
-                # Update monitor if available
-                if hasattr(self, 'monitor'):
-                    self.monitor.update_layer_info(layer_info)
-                
-                # Process layer
-                if isinstance(layer, (Dropout, BatchNormLayer)):
-                    out = layer.forward(out, training)
+            # Ensure input has correct shape (batch_size, channels, height, width)
+            if len(x.shape) != 4:
+                if len(x.shape) == 3:
+                    x = x.reshape(1, *x.shape)  # Add batch dimension
                 else:
-                    out = layer.forward(out)
+                    raise ValueError(f"Expected 4D input, got shape {x.shape}")
             
-            out = to_cpu(out)
-            predictions = softmax(out)
-            
-            if self.memory_cleanup_counter % self.cleanup_frequency == 0:
-                clear_gpu_memory(self.memory_threshold)
-            
-            return to_cpu(predictions)
-            
+            # Use GPU-specific optimizations
+            if self.gpu_config and self.gpu_config['is_high_memory']:
+                return self._forward_parallel(x, training)
+            elif self.use_gpu:
+                return self._forward_in_chunks(x, training) # Changed from _forward_chunked
+            return self._forward_cpu(x, training)
         except Exception as e:
-            print(f"\nError in forward pass: {str(e)}")
+            print(f"Error in forward pass: {e}")
             raise e
+
+    def _forward_single_chunk(self, x, training=False):
+        """Process a single chunk of data with shape tracking"""
+        out = x
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, (Dropout, BatchNormLayer)):
+                out = layer.forward(out, training)
+            else:
+                out = layer.forward(out)
+                
+            # Debug shape after each layer
+            print(f"Layer {i} ({layer.__class__.__name__}) output shape: {out.shape}")
+        
+        # Ensure final output has correct shape
+        if len(out.shape) > 2:
+            out = out.reshape(out.shape[0], -1)
+        return out
 
     def _forward_in_chunks(self, x, training=False):
         """Memory-efficient forward pass with parallel processing"""
@@ -216,23 +235,14 @@ class CNN:
             outputs.append(to_cpu(out))  # Store on CPU to save GPU memory
             
         return to_gpu(np.concatenate(outputs))
-
-    def _forward_parallel(self, x, training=False):
-        """High performance forward pass for 15GB GPU"""
-        with cp.cuda.Stream():
-            outputs = []
-            chunk_size = self.batch_size
-            
-            for i in range(0, len(x), chunk_size):
-                chunk = x[i:i + chunk_size]
-                out = self._forward_single_chunk(chunk, training)
-                outputs.append(out)  # Keep on GPU
-            
-            return cp.concatenate(outputs)
+    
+    def _forward_cpu(self, x, training=False):
+        """CPU fallback forward pass"""
+        return self._forward_single_chunk(x, training)
 
     def train_step(self, x, y):
         try:
-            if self.enable_chunk_processing and x.shape[0] > 4:
+            if self.enable_chunk_processing and x.shape[0] > self.batch_size:
                 return self._train_step_chunked(x, y)
             
             # Clear GPU memory more frequently
@@ -240,10 +250,28 @@ class CNN:
                 clear_gpu_memory(100)
             self.memory_cleanup_counter += 1
             
+            # Ensure x has correct shape
+            if len(x.shape) != 4:
+                raise ValueError(f"Expected input shape (batch_size, channels, height, width), got {x.shape}")
+            
+            # Ensure y has correct shape
+            if len(y.shape) != 2:
+                raise ValueError(f"Expected target shape (batch_size, num_classes), got {y.shape}")
+            
             x = to_gpu(x)
             y = to_gpu(y)
             
             predictions = self.forward(x, training=True)
+            
+            # Ensure predictions have correct shape before loss calculation
+            if predictions.shape[-1] != y.shape[-1]:
+                predictions = predictions.reshape(y.shape[0], -1)
+                if predictions.shape[-1] != y.shape[-1]:
+                    raise ValueError(
+                        f"Predictions shape mismatch. "
+                        f"Got {predictions.shape}, expected shape with {y.shape[-1]} outputs"
+                    )
+            
             predictions = to_gpu(predictions)
             
             loss = float(to_cpu(cross_entropy_loss(predictions, y)))
@@ -262,6 +290,9 @@ class CNN:
             
         except Exception as e:
             print(f"\nError in train_step: {str(e)}")
+            print(f"Input shape: {x.shape}")
+            print(f"Target shape: {y.shape}")
+            print(f"Predictions shape: {predictions.shape if 'predictions' in locals() else 'N/A'}")
             raise e
     
     def _train_step_chunked(self, x, y):
