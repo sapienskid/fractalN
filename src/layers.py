@@ -176,6 +176,20 @@ class ConvLayer:
             except Exception as e:
                 print(f"cuDNN initialization warning: {e}")
                 self.use_cudnn = False
+
+        # Add shape validation
+        self.input_shape = None
+        self.output_shape = None
+        
+        # Add safer cuDNN initialization
+        self.use_cudnn = False
+        if GPU_AVAILABLE and hasattr(cp.cuda, 'cudnn') and cp.cuda.cudnn.available:
+            try:
+                self.use_cudnn = True
+                self.cudnn_handle = cp.cuda.cudnn.get_handle()
+            except Exception as e:
+                print(f"cuDNN initialization failed: {e}")
+                self.use_cudnn = False
     
     def _initialize_params(self, input_shape):
         """Initialize filters based on input shape"""
@@ -236,58 +250,103 @@ class ConvLayer:
             print(f"Error initializing cuDNN descriptors: {e}")
             self.use_cudnn = False
 
+    def _validate_shapes(self, x):
+        """Validate input shapes and calculate output shape"""
+        if len(x.shape) != 4:
+            raise ShapeError(f"Expected 4D input (batch, channels, height, width), got shape {x.shape}")
+        
+        batch_size, in_channels, in_height, in_width = x.shape
+        
+        if self.padding == 'valid':
+            out_height = ((in_height - self.filter_size) // self.stride_int) + 1
+            out_width = ((in_width - self.filter_size) // self.stride_int) + 1
+        else:  # same padding
+            out_height = in_height // self.stride_int
+            out_width = in_width // self.stride_int
+            
+        return (batch_size, self.num_filters, out_height, out_width)
+
     def forward(self, inputs):
         try:
             inputs = to_gpu(inputs)
-            # Initialize parameters if needed
+            self.input_shape = inputs.shape
+            self.output_shape = self._validate_shapes(inputs)
+            
+            # Initialize filters if needed
             if not self.initialized:
                 self._initialize_params(inputs.shape)
             
-            # Verify filter initialization
-            if self.filters is None:
-                raise ValueError("Filters not properly initialized")
-                
-            # Try cuDNN first if available
             if self.use_cudnn:
                 try:
                     return self._forward_cudnn(inputs)
                 except Exception as e:
                     print(f"cuDNN forward failed: {e}, falling back to direct")
+                    self.use_cudnn = False  # Disable cuDNN for future calls
             
-            # Use direct convolution instead of cuDNN
-            self.inputs = inputs
             return self._forward_direct(inputs)
             
         except Exception as e:
-            print(f"Error in ConvLayer forward pass: {e}")
-            raise
+            raise LayerError(
+                f"Error in ConvLayer forward pass: {str(e)}\n"
+                f"Input shape: {self.input_shape}\n"
+                f"Expected output shape: {self.output_shape}",
+                layer_type='ConvLayer'
+            )
+
+    def _forward_cudnn(self, x):
+        """Forward pass using cuDNN with proper error handling"""
+        try:
+            # Create output tensor with proper shape
+            out = self.xp.zeros(self.output_shape, dtype=x.dtype)
+            
+            # Update descriptors
+            self._update_cudnn_descriptors(x)
+            
+            # Perform convolution
+            algo = cp.cuda.cudnn.get_convolution_forward_algorithm(
+                x, self.filters, self.conv_desc, self.cudnn_handle, 
+                deterministic=True
+            )
+            cp.cuda.cudnn.convolution_forward(
+                x, self.filters, out,
+                self.conv_desc, algo, self.cudnn_handle
+            )
+            
+            return out
+            
+        except Exception as e:
+            raise RuntimeError(f"cuDNN forward failed: {str(e)}")
 
     def _forward_direct(self, inputs):
-        """Direct convolution implementation"""
+        """Direct convolution implementation with proper shape handling"""
         batch_size, channels, height, width = inputs.shape
-        output_height = ((height + 2 * self.pad_h - self.filter_size) // self.stride_int) + 1
-        output_width = ((width + 2 * self.pad_w - self.filter_size) // self.stride_int) + 1
+        out_height = ((height + 2 * self.pad_h - self.filter_size) // self.stride_int) + 1
+        out_width = ((width + 2 * self.pad_w - self.filter_size) // self.stride_int) + 1
         
-        # Apply padding
+        # Pre-allocate output array with correct shape
+        output = self.xp.zeros((batch_size, self.num_filters, out_height, out_width))
+        
+        # Apply padding if needed
         if self.padding == 'same':
-            padded_inputs = self.xp.pad(inputs, self.pad, 'constant')
-        else:
-            padded_inputs = inputs
-            
-        output = self.xp.zeros((batch_size, self.num_filters, output_height, output_width))
+            inputs = self.xp.pad(
+                inputs,
+                ((0,0), (0,0), (self.pad_h, self.pad_h), (self.pad_w, self.pad_w)),
+                mode='constant'
+            )
         
-        # Optimized direct convolution
-        for i in range(output_height):
-            for j in range(output_width):
+        # Perform direct convolution
+        for i in range(out_height):
+            for j in range(out_width):
                 h_start = i * self.stride_int
                 h_end = h_start + self.filter_size
                 w_start = j * self.stride_int
                 w_end = w_start + self.filter_size
                 
-                input_slice = padded_inputs[:, :, h_start:h_end, w_start:w_end]
+                # Get input patch and perform convolution
+                input_patch = inputs[:, :, h_start:h_end, w_start:w_end]
                 for k in range(self.num_filters):
                     output[:, k, i, j] = self.xp.sum(
-                        input_slice * self.filters[k, :, :, :], 
+                        input_patch * self.filters[k:k+1],
                         axis=(1,2,3)
                     )
         
