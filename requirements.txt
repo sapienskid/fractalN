@@ -1,5 +1,6 @@
 # Python dependencies
 numpy
+cupy
 tensorflow
 torch
 scikit-learn
@@ -7,3 +8,7 @@ matplotlib
 scipy
 pandas
 opencv-python
+tqdm
+psutil
+GPUtil
+colorama
