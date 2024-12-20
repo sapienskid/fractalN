@@ -146,18 +146,33 @@ class ConvLayer:
             raise e
     
     def _forward_fft(self, inputs):
-        """FFT-based convolution with proper shape handling"""
+        """FFT-based convolution with fixed shape handling"""
         xp = self.xp
         batch_size, in_channels, height, width = inputs.shape
         
-        # Calculate padding
+        # Calculate padding to ensure output shape is correct
         pad_h = self.filter_size - 1
         pad_w = self.filter_size - 1
+        
+        # Calculate FFT size to be power of 2 for efficiency
+        fft_height = 2 ** np.ceil(np.log2(height + pad_h)).astype(int)
+        fft_width = 2 ** np.ceil(np.log2(width + pad_w)).astype(int)
         
         # Pad input for FFT
         padded_inputs = xp.pad(
             inputs, 
-            ((0,0), (0,0), (0,pad_h), (0,pad_w)),
+            ((0,0), (0,0), 
+             (0, fft_height - height), 
+             (0, fft_width - width)),
+            mode='constant'
+        )
+        
+        # Pad filters to match FFT size
+        padded_filters = xp.pad(
+            self.filters,
+            ((0,0), (0,0),
+             (0, fft_height - self.filter_size),
+             (0, fft_width - self.filter_size)),
             mode='constant'
         )
         
@@ -167,33 +182,38 @@ class ConvLayer:
         output = xp.zeros((batch_size, self.num_filters, out_height, out_width), dtype=inputs.dtype)
         
         try:
-            # Prepare for batch FFT
-            fft_inputs = xp.fft.rfft2(padded_inputs)
-            fft_filters = xp.fft.rfft2(self.filters, s=padded_inputs.shape[2:])
-            
-            # Perform convolution in frequency domain
             for i in range(batch_size):
-                for j in range(self.num_filters):
-                    # Ensure shapes match for multiplication
-                    result = xp.fft.irfft2(
-                        fft_inputs[i] * fft_filters[j],
-                        s=padded_inputs.shape[2:]
-                    )
-                    # Extract valid region
-                    output[i,j] = result[:out_height, :out_width]
+                for c in range(in_channels):
+                    # Compute FFT of input channel
+                    fft_input = xp.fft.rfft2(padded_inputs[i, c])
+                    
+                    for f in range(self.num_filters):
+                        # Compute FFT of filter
+                        fft_filter = xp.fft.rfft2(padded_filters[f, c])
+                        
+                        # Multiply in frequency domain
+                        fft_product = fft_input * fft_filter
+                        
+                        # Inverse FFT and accumulate
+                        if c == 0:
+                            output[i, f] = xp.fft.irfft2(fft_product)[:out_height, :out_width]
+                        else:
+                            output[i, f] += xp.fft.irfft2(fft_product)[:out_height, :out_width]
             
             return output
             
         except Exception as e:
-            print(f"FFT convolution failed: {e}")
-            # Fallback to direct convolution
+            print(f"FFT convolution failed: {e}, falling back to direct convolution")
+            # Clear GPU memory before fallback
+            if self.use_gpu:
+                cp.get_default_memory_pool().free_all_blocks()
             return self._forward_direct(inputs)
 
     def _forward_direct(self, inputs):
         """Direct convolution as fallback"""
-        output_height = self.height - self.filter_size + 1
-        output_width = self.width - self.filter_size + 1
-        output = self.xp.zeros((self.batch_size, self.num_filters, output_height, output_width))
+        output_height = inputs.shape[2] - self.filter_size + 1
+        output_width = inputs.shape[3] - self.filter_size + 1
+        output = self.xp.zeros((inputs.shape[0], self.num_filters, output_height, output_width))
         
         for i in range(output_height):
             for j in range(output_width):
