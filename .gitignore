@@ -44,3 +44,13 @@ Thumbs.db
 .ipynb_checkpoints/
 *.pyc
 __pycache__/
+
+# Keep raw dataset but ignore processed
+data/processed/
+data/mushroom_data/
+data/**/aug_*
+results/
+training_history.png
+training_metrics.txt
+training_log.csv
+*.keras
