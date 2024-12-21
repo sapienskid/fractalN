@@ -30,6 +30,7 @@ venv/
 .vscode-upload.json
 .venv/
 
+/data/
 # OS
 .DS_Store
 Thumbs.db

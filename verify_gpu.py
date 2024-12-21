@@ -1,6 +1,6 @@
 import tensorflow as tf
 import os
-from gpu_config import setup_gpu
+from src.gpu_config import setup_gpu
 
 def verify_gpu_setup():
     # Setup GPU configuration

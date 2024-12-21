@@ -6,7 +6,7 @@ import gc
 from model import create_model
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gpu_config import setup_gpu
+from src.gpu_config import setup_gpu
 
 # Configure GPU before importing other dependencies
 setup_gpu()
@@ -16,10 +16,10 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use first GPU
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 # Update image parameters
-IMG_HEIGHT = 160  # Reduced from 224
-IMG_WIDTH = 160   # Reduced from 224
-BATCH_SIZE = 8    # Further reduced batch size
-EPOCHS = 50
+IMG_HEIGHT = 224  # Reduced from 224
+IMG_WIDTH = 224   # Reduced from 224
+BATCH_SIZE = 16    # Further reduced batch size
+EPOCHS = 10
 
 def configure_memory():
     try:
@@ -36,50 +36,34 @@ def configure_memory():
         print(f"Error in GPU configuration: {e}")
 
 def create_data_generators():
-    # Enable memory efficient mode
-    tf.keras.mixed_precision.set_global_policy('mixed_float16')
-    
+    # Simple preprocessing only since images are already augmented
     train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
         rescale=1./255,
-        rotation_range=40,
-        width_shift_range=0.2,
-        height_shift_range=0.2,
-        shear_range=0.2,
-        zoom_range=0.2,
-        horizontal_flip=True,
-        vertical_flip=True,
-        fill_mode='nearest'
+        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
     )
 
     test_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
-        rescale=1./255
+        rescale=1./255,
+        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
     )
 
-    # Print directory contents before creating generators
-    print("\nChecking data directory contents:")
-    for split in ['train', 'test']:
-        for category in ['poisonous', 'edible']:
-            path = os.path.join('data', split, category)
-            files = os.listdir(path)
-            print(f"{split}/{category}: {len(files)} files")
-
+    # Update paths to use processed data
     train_generator = train_datagen.flow_from_directory(
-        'data/train',
+        'data/processed/train',  # Updated path
         target_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=BATCH_SIZE,
         class_mode='binary',
         shuffle=True,
         seed=42,
-        color_mode='rgb',
-        interpolation='bilinear'
+        color_mode='rgb'
     )
 
     validation_generator = test_datagen.flow_from_directory(
-        'data/test',  # Using test data for validation
+        'data/processed/test',  # Updated path
         target_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=BATCH_SIZE,
         class_mode='binary',
-        shuffle=False,  # No need to shuffle validation data
+        shuffle=False,
         color_mode='rgb'
     )
 
@@ -140,52 +124,38 @@ def train_model():
     
     train_generator, validation_generator = create_data_generators()
     
-    # Calculate steps properly
-    total_train_samples = train_generator.samples
-    total_val_samples = validation_generator.samples
-    
-    steps_per_epoch = total_train_samples // BATCH_SIZE
-    validation_steps = total_val_samples // BATCH_SIZE
+    # Calculate correct steps
+    steps_per_epoch = train_generator.n // BATCH_SIZE
+    validation_steps = validation_generator.n // BATCH_SIZE
+
+    # Ensure we don't run out of data
+    if train_generator.n % BATCH_SIZE != 0:
+        steps_per_epoch += 1
+    if validation_generator.n % BATCH_SIZE != 0:
+        validation_steps += 1
 
     print(f"\nTraining configuration:")
-    print(f"Total training samples: {total_train_samples}")
-    print(f"Total validation samples: {total_val_samples}")
+    print(f"Training samples: {train_generator.n}")
+    print(f"Validation samples: {validation_generator.n}")
+    print(f"Batch size: {BATCH_SIZE}")
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Validation steps: {validation_steps}")
-    print(f"Batch size: {BATCH_SIZE}")
 
     # Create model
     inputs = tf.keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
     model = create_model(inputs)
     
-    # Modified learning rate and optimizer setup with proper type casting
-    initial_learning_rate = 0.001
-    decay_steps = 1000
-    decay_rate = 0.9
+    # Modified optimizer with lower learning rate
+    initial_learning_rate = 0.0001  # Reduced from 0.001
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=initial_learning_rate,
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-07,
+        clipnorm=1.0  # Added gradient clipping
+    )
     
-    class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-        def __init__(self, initial_learning_rate, decay_steps, decay_rate):
-            self.initial_learning_rate = float(initial_learning_rate)
-            self.decay_steps = int(decay_steps)
-            self.decay_rate = float(decay_rate)
-        
-        def __call__(self, step):
-            step_float = tf.cast(step, tf.float32)
-            decay_steps_float = tf.cast(self.decay_steps, tf.float32)
-            decay_factor = tf.pow(self.decay_rate, tf.floor(step_float / decay_steps_float))
-            return self.initial_learning_rate * decay_factor
-
-        def get_config(self):
-            return {
-                "initial_learning_rate": self.initial_learning_rate,
-                "decay_steps": self.decay_steps,
-                "decay_rate": self.decay_rate
-            }
-    
-    # Create optimizer with fixed learning rate first
-    optimizer = tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
-    
-    # Compile model
+    # Compile model with added gradient clipping
     model.compile(
         optimizer=optimizer,
         loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
@@ -197,19 +167,19 @@ def train_model():
         ]
     )
 
-    # Update callbacks to monitor both metrics
+    # Update callbacks with more patience
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
             monitor='val_loss',
-            patience=10,
+            patience=15,  # Increased from 10
             restore_best_weights=True,
             verbose=1
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss',
-            factor=0.2,
-            patience=5,
-            min_lr=1e-6,
+            factor=0.1,  # Changed from 0.2
+            patience=7,   # Increased from 5
+            min_lr=1e-7,
             verbose=1
         ),
         tf.keras.callbacks.ModelCheckpoint(
@@ -235,11 +205,19 @@ def train_model():
         validation_data=validation_generator,
         validation_steps=validation_steps,
         callbacks=callbacks,
-        verbose=1
+        verbose=1,
+        shuffle=True
     )
 
-    # Final evaluation
-    val_metrics = model.evaluate(validation_generator)
+    # Reset generators before evaluation
+    validation_generator.reset()
+    
+    # Evaluate model
+    val_metrics = model.evaluate(
+        validation_generator,
+        steps=validation_steps
+    )
+
     print(f"\nValidation loss: {val_metrics[0]:.4f}")
     print(f"Validation accuracy: {val_metrics[1]:.4f}")
     print(f"Validation AUC: {val_metrics[2]:.4f}")

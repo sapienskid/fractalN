@@ -2,6 +2,11 @@ import tensorflow as tf
 import numpy as np
 from PIL import Image
 import sys
+import os
+from gpu_config import setup_gpu
+
+# Configure GPU at startup
+setup_gpu()
 
 def load_and_prep_image(image_path):
     # Read JPEG file
@@ -17,32 +22,43 @@ def load_and_prep_image(image_path):
     return img
 
 def predict_mushroom(model_path, image_path):
-    # Update model path to use .keras extension
-    model = tf.keras.models.load_model(model_path.replace('.h5', '.keras'))
-    
-    # Prepare the image
-    processed_image = load_and_prep_image(image_path)
-    
-    # Make prediction with adjusted threshold
-    prediction = model.predict(processed_image)
-    
-    # Use standard threshold since data is balanced
-    THRESHOLD = 0.5
-    
-    # Interpret results
-    if prediction[0][0] > THRESHOLD:
-        return "Poisonous", prediction[0][0]
-    else:
-        return "Edible", 1 - prediction[0][0]
+    try:
+        # Ensure we're using the GPU
+        with tf.device('/GPU:0'):
+            # Load model with compile=False to avoid optimizer state loading
+            model = tf.keras.models.load_model(model_path.replace('.h5', '.keras'), compile=False)
+            
+            # Recompile model with basic settings
+            model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+            
+            # Prepare the image
+            processed_image = load_and_prep_image(image_path)
+            
+            # Make prediction
+            prediction = model.predict(processed_image, verbose=0)
+            
+            # Extract the scalar prediction value
+            pred_value = float(prediction[0])
+            
+            # Use standard threshold
+            THRESHOLD = 0.5
+            
+            # Return prediction and raw confidence value
+            if pred_value > THRESHOLD:
+                return "Poisonous", pred_value
+            else:
+                return "Edible", 1 - pred_value
+    except Exception as e:
+        print(f"Error making prediction: {e}")
+        raise
 
-def analyze_prediction_confidence(prediction):
+def analyze_prediction_confidence(confidence):
     """Helper function to provide more detailed analysis"""
-    raw_score = prediction[0][0]
-    if raw_score > 0.8:
+    if confidence > 0.8:
         confidence_level = "Very High"
-    elif raw_score > 0.6:
+    elif confidence > 0.6:
         confidence_level = "High"
-    elif raw_score > 0.4:
+    elif confidence > 0.4:
         confidence_level = "Moderate"
     else:
         confidence_level = "Low"
@@ -57,7 +73,7 @@ if __name__ == "__main__":
     if not sys.argv[1].lower().endswith(('.jpg', '.jpeg')):
         print("Warning: Image file should be in JPEG format")
     
-    result, confidence = predict_mushroom('mushroom_classifier.keras', sys.argv[1])
+    result, confidence = predict_mushroom('/home/sapienskid/Development/FractalN/src/mushroom_classifier.keras', sys.argv[1])
     confidence_level = analyze_prediction_confidence(confidence)
     print(f"Prediction: {result}")
     print(f"Confidence: {confidence:.2%}")
