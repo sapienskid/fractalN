@@ -36,9 +36,16 @@ def configure_memory():
         print(f"Error in GPU configuration: {e}")
 
 def create_data_generators():
-    # Simple preprocessing only since images are already augmented
+    """Create data generators with proper data augmentation"""
     train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
         rescale=1./255,
+        rotation_range=20,
+        width_shift_range=0.2,
+        height_shift_range=0.2,
+        shear_range=0.2,
+        zoom_range=0.2,
+        horizontal_flip=True,
+        fill_mode='nearest',
         preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
     )
 
@@ -47,33 +54,22 @@ def create_data_generators():
         preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
     )
 
-    # Update paths to use processed data
     train_generator = train_datagen.flow_from_directory(
-        'data/processed/train',  # Updated path
+        'data/processed/train',
         target_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=BATCH_SIZE,
         class_mode='binary',
         shuffle=True,
-        seed=42,
-        color_mode='rgb'
+        seed=42
     )
 
     validation_generator = test_datagen.flow_from_directory(
-        'data/processed/test',  # Updated path
+        'data/processed/test',
         target_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=BATCH_SIZE,
         class_mode='binary',
-        shuffle=False,
-        color_mode='rgb'
+        shuffle=False
     )
-
-    # Print class distribution
-    print("\nClass distribution in generators:")
-    print(f"Train generator: {train_generator.samples} total samples")
-    print(f"Train class indices: {train_generator.class_indices}")
-    print(f"Train class counts: {np.bincount(train_generator.classes)}")
-    print(f"Validation generator: {validation_generator.samples} total samples")
-    print(f"Validation class counts: {np.bincount(validation_generator.classes)}")
 
     return train_generator, validation_generator
 
@@ -122,6 +118,11 @@ def train_model():
     # Configure memory
     configure_memory()
     
+    # First preprocess the dataset
+    from utils.preprocess_data import preprocess_dataset
+    preprocess_dataset()
+    
+    # Create data generators
     train_generator, validation_generator = create_data_generators()
     
     # Calculate correct steps
