@@ -7,6 +7,8 @@ from model import create_model
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.gpu_config import setup_gpu
+tf.keras.backend.set_floatx('float32')  # Ensure we're using FP32
+
 
 # Configure GPU before importing other dependencies
 setup_gpu()
@@ -17,9 +19,10 @@ os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 # Update image parameters
 IMG_HEIGHT = 224  # Reduced from 224
-IMG_WIDTH = 224   # Reduced from 224
-BATCH_SIZE = 16    # Further reduced batch size
-EPOCHS = 10
+IMG_WIDTH = 224  # Reduced from 224
+BATCH_SIZE = 32   # Reduced from 32
+EPOCHS = 50  # Increased to allow more training time
+LEARNING_RATE = 5e-5  # Reduced learning rate for better stability
 
 def configure_memory():
     try:
@@ -35,39 +38,46 @@ def configure_memory():
     except Exception as e:
         print(f"Error in GPU configuration: {e}")
 
-def create_data_generators():
-    """Create data generators with proper data augmentation"""
+
+
+
+def create_data_generators(img_height=224, img_width=224, batch_size=32):
+    """Create enhanced data generators with strong augmentation"""
     train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
         rescale=1./255,
-        rotation_range=20,
+        rotation_range=40,
         width_shift_range=0.2,
         height_shift_range=0.2,
         shear_range=0.2,
         zoom_range=0.2,
         horizontal_flip=True,
-        fill_mode='nearest',
-        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input,
-        validation_split=0.2  # Add validation split
+        vertical_flip=True,
+        fill_mode='reflect',
+        brightness_range=[0.7, 1.3],
+        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
     )
 
-    # Use same generator for both training and validation
+    # Validation generator with minimal processing
+    val_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
+        rescale=1./255,
+        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
+    )
+
     train_generator = train_datagen.flow_from_directory(
         'data/processed/train',
-        target_size=(IMG_HEIGHT, IMG_WIDTH),
-        batch_size=BATCH_SIZE,
+        target_size=(img_height, img_width),
+        batch_size=batch_size,
         class_mode='binary',
         shuffle=True,
-        seed=42,
-        subset='training'  # Specify training subset
+        seed=42
     )
 
-    validation_generator = train_datagen.flow_from_directory(
-        'data/processed/train',  # Use same directory
-        target_size=(IMG_HEIGHT, IMG_WIDTH),
-        batch_size=BATCH_SIZE,
+    validation_generator = val_datagen.flow_from_directory(
+        'data/processed/test',
+        target_size=(img_height, img_width),
+        batch_size=batch_size,
         class_mode='binary',
-        shuffle=False,
-        subset='validation'  # Specify validation subset
+        shuffle=False
     )
 
     return train_generator, validation_generator
@@ -132,7 +142,7 @@ def train_model(preprocess=False):
         
         # Step 2: Augment
         from utils.augment_mushroom_data import augment_mushroom_data
-        augment_mushroom_data(target_count=1500)
+        augment_mushroom_data(target_count=5000)
         
         # Step 3: Preprocess
         from utils.preprocess_data import preprocess_dataset
@@ -168,13 +178,12 @@ def train_model(preprocess=False):
     model = create_model(inputs)
     
     # Modified optimizer with lower learning rate
-    initial_learning_rate = 0.0001  # Reduced from 0.001
     optimizer = tf.keras.optimizers.Adam(
-        learning_rate=initial_learning_rate,
+        learning_rate=LEARNING_RATE,
         beta_1=0.9,
         beta_2=0.999,
         epsilon=1e-07,
-        clipnorm=1.0  # Added gradient clipping
+        clipnorm=1.0
     )
     
     # Compile model with added gradient clipping
@@ -189,29 +198,28 @@ def train_model(preprocess=False):
         ]
     )
 
-    # Update callbacks to use proper metrics
+    # Update model training configuration
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
-            monitor='loss',  # Changed from val_loss
-            patience=15,
+            monitor='val_loss',  # Changed back to val_loss
+            patience=10,
             restore_best_weights=True,
             verbose=1
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='loss',  # Changed from val_loss
-            factor=0.1,
-            patience=7,
+            monitor='val_loss',  # Changed back to val_loss
+            factor=0.5,  # Less aggressive reduction
+            patience=5,
             min_lr=1e-7,
             verbose=1
         ),
         tf.keras.callbacks.ModelCheckpoint(
             'best_model.keras',
-            monitor='accuracy',  # Changed from val_accuracy
+            monitor='val_accuracy',  # Changed back to val_accuracy
             save_best_only=True,
             mode='max',
             verbose=1
         ),
-        tf.keras.callbacks.CSVLogger('training_log.csv'),
         tf.keras.callbacks.LambdaCallback(
             on_epoch_end=lambda epoch, logs: gc.collect()
         )

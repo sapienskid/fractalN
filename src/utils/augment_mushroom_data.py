@@ -11,75 +11,90 @@ from gpu_config import setup_gpu
 
 setup_gpu()
 
+# Add custom layer definitions
+class RandomSaturation(tf.keras.layers.Layer):
+    def __init__(self, lower=0.7, upper=1.3, **kwargs):
+        super().__init__(**kwargs)
+        self.lower = lower
+        self.upper = upper
+    
+    def call(self, inputs, training=None):
+        if training:
+            return tf.image.random_saturation(inputs, self.lower, self.upper)
+        return inputs
+
+class RandomHue(tf.keras.layers.Layer):
+    def __init__(self, factor=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.factor = factor
+    
+    def call(self, inputs, training=None):
+        if training:
+            return tf.image.random_hue(inputs, self.factor)
+        return inputs
+
+class RandomBlur(tf.keras.layers.Layer):
+    def __init__(self, prob=0.3, **kwargs):
+        super().__init__(**kwargs)
+        self.prob = prob
+    
+    def call(self, inputs, training=None):
+        if training and tf.random.uniform([]) < self.prob:
+            return tf.nn.avg_pool2d(inputs, ksize=3, strides=1, padding='SAME')
+        return inputs
 
 def create_augmented_image(image, seed=None):
-    """Create an augmented version of a single image with extensive variations"""
+    """Create truly augmented version of the image without tensorflow-addons"""
     if seed is not None:
-        tf.random.set_seed(seed)
         np.random.seed(seed)
+        tf.random.set_seed(seed)
     
-    # Ensure proper format
-    image = tf.cast(image, tf.float32)
-    if tf.reduce_max(image) > 1.0:
-        image = image / 255.0
-
-    # Enhanced augmentation pipeline
-    augmentation = tf.keras.Sequential([
-        # Geometric transformations
-        tf.keras.layers.RandomRotation(0.5, fill_mode='reflect'),  # More rotation
-        tf.keras.layers.RandomTranslation(0.3, 0.3, fill_mode='reflect'),  # More translation
-        tf.keras.layers.RandomZoom(0.3, fill_mode='reflect'),  # More zoom
-        tf.keras.layers.RandomFlip("horizontal_and_vertical"),
-        
-        # Added new transformations
-        tf.keras.layers.RandomCrop(height=image.shape[0], width=image.shape[1]),
-        tf.keras.layers.RandomContrast(0.4),  # Increased contrast range
-    ])
+    # Convert to float32
+    image = tf.cast(image, tf.float32) / 255.0
     
-    # Apply base augmentations
-    augmented = augmentation(tf.expand_dims(image, 0))[0]
+    # Basic transformations using tf.image
+    image = tf.image.random_flip_left_right(image)
+    image = tf.image.random_flip_up_down(image)
     
-    # Additional color augmentations
-    augmented = tf.image.random_brightness(augmented, 0.4)  # Increased brightness range
-    augmented = tf.image.random_saturation(augmented, 0.6, 1.6)  # Increased saturation range
-    augmented = tf.image.random_hue(augmented, 0.2)  # Added hue variation
+    # Color transformations
+    image = tf.image.random_brightness(image, 0.4)
+    image = tf.image.random_contrast(image, 0.5, 1.5)
+    image = tf.image.random_saturation(image, 0.5, 1.5)
+    image = tf.image.random_hue(image, 0.2)
     
-    # Convert to numpy for OpenCV operations
-    augmented_np = augmented.numpy()
-    augmented_np = (augmented_np * 255).astype(np.uint8)
+    # Add random noise
+    noise = tf.random.normal(tf.shape(image), mean=0.0, stddev=0.05)
+    image = image + noise
     
-    # Random OpenCV filters (apply one randomly)
-    if np.random.random() < 0.3:  # 30% chance for each image
-        filter_choice = np.random.choice(['blur', 'sharpen', 'edge'])
-        
-        if filter_choice == 'blur':
-            # Gaussian blur with random kernel size
-            kernel_size = np.random.choice([3, 5, 7])
-            augmented_np = cv2.GaussianBlur(augmented_np, (kernel_size, kernel_size), 0)
-        
-        elif filter_choice == 'sharpen':
-            # Sharpen filter
-            kernel = np.array([[-1,-1,-1],
-                             [-1, 9,-1],
-                             [-1,-1,-1]])
-            augmented_np = cv2.filter2D(augmented_np, -1, kernel)
-        
-        elif filter_choice == 'edge':
-            # Edge enhancement
-            kernel = np.array([[0,-1,0],
-                             [-1,5,-1],
-                             [0,-1,0]])
-            augmented_np = cv2.filter2D(augmented_np, -1, kernel)
+    # Random rotation (using tf.image instead of tfa)
+    # Convert angle from degrees to radians
+    angle = np.random.uniform(-45, 45) * np.pi / 180
+    image = tf.image.rot90(image, k=int(angle/(np.pi/2)))
     
-    # Random noise (20% chance)
-    if np.random.random() < 0.2:
-        noise = np.random.normal(0, 15, augmented_np.shape).astype(np.uint8)
-        augmented_np = cv2.add(augmented_np, noise)
+    # Random crop and resize (similar to zoom)
+    crop_size = tf.random.uniform([], 0.8, 1.0, dtype=tf.float32)
+    h, w = tf.shape(image)[0], tf.shape(image)[1]
+    crop_h = tf.cast(tf.cast(h, tf.float32) * crop_size, tf.int32)
+    crop_w = tf.cast(tf.cast(w, tf.float32) * crop_size, tf.int32)
+    image = tf.image.random_crop(image, [crop_h, crop_w, 3])
+    image = tf.image.resize(image, [h, w])
     
-    # Ensure proper range
-    augmented_np = np.clip(augmented_np, 0, 255)
+    # Random blur using conv2d
+    if tf.random.uniform([]) < 0.3:
+        gaussian_kernel = tf.cast([[1, 2, 1], [2, 4, 2], [1, 2, 1]], tf.float32) / 16
+        gaussian_kernel = gaussian_kernel[:, :, tf.newaxis, tf.newaxis]
+        gaussian_kernel = tf.tile(gaussian_kernel, [1, 1, 3, 1])
+        image = tf.nn.depthwise_conv2d(
+            tf.expand_dims(image, 0),
+            gaussian_kernel,
+            strides=[1, 1, 1, 1],
+            padding='SAME'
+        )[0]
     
-    return augmented_np
+    # Ensure values are in valid range
+    image = tf.clip_by_value(image, 0.0, 1.0)
+    
+    return tf.cast(image * 255, tf.uint8).numpy()
 
 def augment_mushroom_data(data_dir='data/mushroom_data', target_count=14000):
     """Augment mushroom images to reach exactly target_count images per class"""
@@ -113,7 +128,6 @@ def augment_mushroom_data(data_dir='data/mushroom_data', target_count=14000):
                 print(f"\nWarning: {category} already has {stats[category]} images.")
                 print(f"Removing {abs(needed)} images to reach target...")
                 
-                # Remove excess images if we have more than target
                 category_path = base_path / category
                 all_images = list(category_path.glob('*.[Jj][Pp][Gg]'))
                 images_to_remove = all_images[target_count:]
@@ -153,17 +167,17 @@ def augment_mushroom_data(data_dir='data/mushroom_data', target_count=14000):
                         
                         # Generate variations
                         for i in range(num_variations):
-                            # Generate augmented image
+                            # Generate augmented image with multiple attempts
                             augmented = create_augmented_image(
                                 img_array, 
                                 seed=idx * augmentations_per_image + i
                             )
                             
-                            # Save using PIL to preserve colors
+                            # Save using PIL
                             aug_filename = f"aug_{idx}_{i}_{Path(img_path).stem}.jpg"
                             aug_path = category_path / aug_filename
                             
-                            # Convert tensor to PIL Image and save
+                            # Convert numpy array to PIL Image and save
                             Image.fromarray(augmented).save(
                                 aug_path,
                                 'JPEG',
@@ -184,7 +198,6 @@ def augment_mushroom_data(data_dir='data/mushroom_data', target_count=14000):
     except Exception as e:
         print(f"Error during augmentation: {str(e)}")
         raise
-
 if __name__ == "__main__":
     print("Starting balanced mushroom data augmentation...")
     augment_mushroom_data(target_count=5000)
