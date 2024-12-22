@@ -73,7 +73,7 @@ if __name__ == "__main__":
     if not sys.argv[1].lower().endswith(('.jpg', '.jpeg')):
         print("Warning: Image file should be in JPEG format")
     
-    result, confidence = predict_mushroom('/home/sapienskid/Development/FractalN/src/mushroom_classifier.keras', sys.argv[1])
+    result, confidence = predict_mushroom('mushroom_classifier.keras', sys.argv[1])
     confidence_level = analyze_prediction_confidence(confidence)
     print(f"Prediction: {result}")
     print(f"Confidence: {confidence:.2%}")

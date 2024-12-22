@@ -187,5 +187,5 @@ def augment_mushroom_data(data_dir='data/mushroom_data', target_count=14000):
 
 if __name__ == "__main__":
     print("Starting balanced mushroom data augmentation...")
-    augment_mushroom_data(target_count=20000)
+    augment_mushroom_data(target_count=5000)
     print("\nAugmentation complete!")

@@ -40,6 +40,26 @@ To run this project in Google Colab:
 3. Run all cells in order
 4. Results will be saved to your Google Drive in 'FractalN_Results' folder
 
+## Google Colab Usage
+
+The notebook automatically handles data preprocessing and caching:
+
+1. First run:
+   - Preprocesses the raw dataset
+   - Saves processed data to your Google Drive
+   - Trains the model
+
+2. Subsequent runs:
+   - Loads preprocessed data from Drive
+   - Skips preprocessing step
+   - Directly starts training
+
+This saves significant time and Colab resources on repeated runs.
+
+Location of cached data in Google Drive:
+- Preprocessed data: `FractalN_Data/processed_data.zip`
+- Results: `FractalN_Data/Results/`
+
 ## Local Setup
 
 ```bash
@@ -73,3 +93,4 @@ Note: The total dataset size is approximately [SIZE]MB.
 ## Model Training
 
 The complete training pipeline is available in `Mushroom_Classifier.ipynb`
+```

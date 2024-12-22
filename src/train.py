@@ -46,29 +46,28 @@ def create_data_generators():
         zoom_range=0.2,
         horizontal_flip=True,
         fill_mode='nearest',
-        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
+        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input,
+        validation_split=0.2  # Add validation split
     )
 
-    test_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
-        rescale=1./255,
-        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
-    )
-
+    # Use same generator for both training and validation
     train_generator = train_datagen.flow_from_directory(
         'data/processed/train',
         target_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=BATCH_SIZE,
         class_mode='binary',
         shuffle=True,
-        seed=42
+        seed=42,
+        subset='training'  # Specify training subset
     )
 
-    validation_generator = test_datagen.flow_from_directory(
-        'data/processed/test',
+    validation_generator = train_datagen.flow_from_directory(
+        'data/processed/train',  # Use same directory
         target_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=BATCH_SIZE,
         class_mode='binary',
-        shuffle=False
+        shuffle=False,
+        subset='validation'  # Specify validation subset
     )
 
     return train_generator, validation_generator
@@ -110,7 +109,13 @@ def save_metrics(history, test_metrics):
         f.write(f"Test accuracy: {test_metrics[1]:.4f}\n")
         f.write(f"Test AUC: {test_metrics[2]:.4f}\n")
 
-def train_model():
+def train_model(preprocess=False):
+    """
+    Train the mushroom classifier model
+    
+    Args:
+        preprocess (bool): Whether to run complete preprocessing pipeline (default: False)
+    """
     # Clear memory
     gc.collect()
     tf.keras.backend.clear_session()
@@ -118,27 +123,43 @@ def train_model():
     # Configure memory
     configure_memory()
     
-    # First preprocess the dataset
-    from utils.preprocess_data import preprocess_dataset
-    preprocess_dataset()
+    # Optional complete preprocessing pipeline
+    if preprocess:
+        print("Running complete preprocessing pipeline...")
+        # Step 1: Organize
+        from utils.reorganize_data import reorganize_mushroom_data
+        reorganize_mushroom_data()
+        
+        # Step 2: Augment
+        from utils.augment_mushroom_data import augment_mushroom_data
+        augment_mushroom_data(target_count=1500)
+        
+        # Step 3: Preprocess
+        from utils.preprocess_data import preprocess_dataset
+        preprocess_dataset(
+            data_dir='data/mushroom_data',
+            output_dir='data/processed',
+            test_size=0.2,
+            img_size=(224, 224)
+        )
+    else:
+        # Verify processed data exists
+        if not os.path.exists('data/processed'):
+            raise FileNotFoundError(
+                "Processed data not found in data/processed. "
+                "Run with preprocess=True or process data first"
+            )
     
     # Create data generators
     train_generator, validation_generator = create_data_generators()
     
     # Calculate correct steps
-    steps_per_epoch = train_generator.n // BATCH_SIZE
-    validation_steps = validation_generator.n // BATCH_SIZE
-
-    # Ensure we don't run out of data
-    if train_generator.n % BATCH_SIZE != 0:
-        steps_per_epoch += 1
-    if validation_generator.n % BATCH_SIZE != 0:
-        validation_steps += 1
+    steps_per_epoch = len(train_generator)  # Changed to use len()
+    validation_steps = len(validation_generator)  # Changed to use len()
 
     print(f"\nTraining configuration:")
-    print(f"Training samples: {train_generator.n}")
-    print(f"Validation samples: {validation_generator.n}")
-    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Training samples: {train_generator.samples}")
+    print(f"Validation samples: {validation_generator.samples}")
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Validation steps: {validation_steps}")
 
@@ -168,37 +189,35 @@ def train_model():
         ]
     )
 
-    # Update callbacks with more patience
+    # Update callbacks to use proper metrics
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=15,  # Increased from 10
+            monitor='loss',  # Changed from val_loss
+            patience=15,
             restore_best_weights=True,
             verbose=1
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.1,  # Changed from 0.2
-            patience=7,   # Increased from 5
+            monitor='loss',  # Changed from val_loss
+            factor=0.1,
+            patience=7,
             min_lr=1e-7,
             verbose=1
         ),
         tf.keras.callbacks.ModelCheckpoint(
             'best_model.keras',
-            monitor='val_accuracy',
+            monitor='accuracy',  # Changed from val_accuracy
             save_best_only=True,
             mode='max',
             verbose=1
         ),
-        # Add progress logging callback
         tf.keras.callbacks.CSVLogger('training_log.csv'),
-        # Add memory cleanup callback
         tf.keras.callbacks.LambdaCallback(
             on_epoch_end=lambda epoch, logs: gc.collect()
         )
     ]
 
-    # Train the model with simplified parameters
+    # Train the model with updated parameters
     history = model.fit(
         train_generator,
         epochs=EPOCHS,
@@ -231,4 +250,4 @@ def train_model():
     model.save('mushroom_classifier.keras')  # Changed from .h5 to .keras
 
 if __name__ == "__main__":
-    train_model()
+    train_model(preprocess=True)

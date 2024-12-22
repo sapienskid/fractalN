@@ -54,3 +54,5 @@ training_history.png
 training_metrics.txt
 training_log.csv
 *.keras
+
+/trained/
