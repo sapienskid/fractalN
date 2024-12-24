@@ -108,9 +108,19 @@ def train_model(preprocess=False):
     val_ds = datasets['validation']
     test_ds = datasets['test']
     
-    # Calculate steps
-    steps_per_epoch = len(train_ds)
-    validation_steps = len(val_ds)
+    # Calculate steps properly
+    steps_per_epoch = tf.data.experimental.cardinality(train_ds).numpy()
+    if steps_per_epoch == tf.data.experimental.INFINITE_CARDINALITY:
+        # Calculate steps based on number of files
+        num_train_files = sum(len(list((Path('data/processed/train')/c).glob('*.jpg'))) 
+                            for c in ['poisonous', 'edible'])
+        steps_per_epoch = num_train_files // BATCH_SIZE
+    
+    validation_steps = tf.data.experimental.cardinality(val_ds).numpy()
+    if validation_steps == tf.data.experimental.INFINITE_CARDINALITY:
+        num_val_files = sum(len(list((Path('data/processed/validation')/c).glob('*.jpg'))) 
+                          for c in ['poisonous', 'edible'])
+        validation_steps = num_val_files // BATCH_SIZE
 
     print(f"\nTraining configuration:")
     print(f"Steps per epoch: {steps_per_epoch}")
@@ -151,17 +161,17 @@ def train_model(preprocess=False):
         ]
     )
 
-    # Callbacks
+    # Update callbacks
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=20,  # Increased patience
+            monitor='val_accuracy',  # Changed from val_loss
+            patience=20,
             restore_best_weights=True,
             verbose=1,
-            min_delta=0.001  # Minimum improvement required
+            min_delta=0.001
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
+            monitor='val_accuracy',  # Changed from val_loss
             factor=0.5,
             patience=10,
             min_lr=1e-6,
