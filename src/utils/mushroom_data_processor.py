@@ -88,35 +88,35 @@ class MushroomDataProcessor:
 
     def _process_training_data(self, train_splits):
         """Process and augment training data"""
-        # Calculate target counts for balanced classes
-        max_count = max(len(files) for files in train_splits.values())
+        # Calculate target count for both classes
+        max_count = max(len(files) for files in train_splits.values()) * 2  # Double the max count
         
         for category, files in train_splits.items():
             print(f"\nProcessing {category} training images...")
-            needed = max_count - len(files)
+            current_count = len(files)
+            needed = max_count - current_count
             
-            # Process original files with progress bar
+            # Process original files
             for img_path in tqdm(files, desc=f"Processing original {category} images"):
                 self._process_image(img_path, 
                                   self.processed_dir / 'train' / category,
                                   augment=False)
             
-            # Add augmented versions if needed
-            if needed > 0:
-                print(f"Generating {needed} augmented images...")
-                augmentations_per_image = math.ceil(needed / len(files))
-                
-                with tqdm(total=needed, desc=f"Generating augmented {category} images") as pbar:
-                    for img_path in files:
-                        for i in range(augmentations_per_image):
-                            if needed <= 0:
-                                break
-                            self._process_image(img_path,
-                                              self.processed_dir / 'train' / category,
-                                              augment=True,
-                                              suffix=f'_aug_{i}')
-                            needed -= 1
-                            pbar.update(1)
+            # Always augment both classes
+            print(f"Generating augmented {category} images...")
+            augmentations_per_image = math.ceil(needed / len(files))
+            
+            with tqdm(total=needed, desc=f"Generating augmented {category} images") as pbar:
+                for img_path in files:
+                    for i in range(augmentations_per_image):
+                        if needed <= 0:
+                            break
+                        self._process_image(img_path,
+                                          self.processed_dir / 'train' / category,
+                                          augment=True,
+                                          suffix=f'_aug_{i}')
+                        needed -= 1
+                        pbar.update(1)
 
     def _process_evaluation_data(self, split_data, split_name):
         """Process validation/test data without augmentation"""

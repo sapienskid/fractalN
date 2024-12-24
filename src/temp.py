@@ -109,20 +109,21 @@ def train_model(preprocess=False):
     test_ds = datasets['test']
     
     # Calculate steps properly
-    steps_per_epoch = tf.data.experimental.cardinality(train_ds).numpy()
-    if steps_per_epoch == tf.data.experimental.INFINITE_CARDINALITY:
-        # Calculate steps based on number of files
-        num_train_files = sum(len(list((Path('data/processed/train')/c).glob('*.jpg'))) 
-                            for c in ['poisonous', 'edible'])
-        steps_per_epoch = num_train_files // BATCH_SIZE
+    num_train_files = sum(len(list((Path('data/processed/train')/c).glob('*.jpg'))) 
+                         for c in ['poisonous', 'edible'])
+    steps_per_epoch = num_train_files // BATCH_SIZE
     
-    validation_steps = tf.data.experimental.cardinality(val_ds).numpy()
-    if validation_steps == tf.data.experimental.INFINITE_CARDINALITY:
-        num_val_files = sum(len(list((Path('data/processed/validation')/c).glob('*.jpg'))) 
-                          for c in ['poisonous', 'edible'])
-        validation_steps = num_val_files // BATCH_SIZE
-
+    num_val_files = sum(len(list((Path('data/processed/validation')/c).glob('*.jpg'))) 
+                       for c in ['poisonous', 'edible'])
+    validation_steps = num_val_files // BATCH_SIZE
+    
+    # Make sure steps are at least 1
+    steps_per_epoch = max(1, steps_per_epoch)
+    validation_steps = max(1, validation_steps)
+    
     print(f"\nTraining configuration:")
+    print(f"Total training files: {num_train_files}")
+    print(f"Total validation files: {num_val_files}")
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Validation steps: {validation_steps}")
 
