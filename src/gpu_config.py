@@ -1,5 +1,6 @@
-import tensorflow as tf
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Add this before importing tensorflow
+import tensorflow as tf
 import subprocess
 import re
 

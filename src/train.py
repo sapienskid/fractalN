@@ -1,6 +1,7 @@
 import tensorflow as tf
 import numpy as np
 import os
+from pathlib import Path  # Add this import
 import matplotlib.pyplot as plt
 import gc
 from model import create_model
@@ -18,11 +19,13 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use first GPU
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 # Update image parameters
-IMG_HEIGHT = 224  # Reduced from 224
-IMG_WIDTH = 224  # Reduced from 224
-BATCH_SIZE = 32   # Reduced from 32
-EPOCHS = 50  # Increased to allow more training time
-LEARNING_RATE = 5e-5  # Reduced learning rate for better stability
+IMG_HEIGHT = 160  # Reduced from 224
+IMG_WIDTH = 160   # Reduced from 224
+BATCH_SIZE = 8    # Reduced from 32
+EPOCHS = 100     # Increase epochs since we'll use better LR schedule
+LEARNING_RATE = 2e-4  # Fine-tuned learning rate
+warmup_epochs = 5
+decay_epochs = EPOCHS - warmup_epochs
 
 def configure_memory():
     try:
@@ -41,26 +44,22 @@ def configure_memory():
 
 
 
-def create_data_generators(img_height=224, img_width=224, batch_size=32):
-    """Create enhanced data generators with strong augmentation"""
+def create_data_generators(img_height=IMG_HEIGHT, img_width=IMG_WIDTH, batch_size=BATCH_SIZE):
+    """Create simple data generators with only rescaling"""
+    # Enhanced data augmentation in generators
     train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
         rescale=1./255,
-        rotation_range=40,
+        rotation_range=30,
         width_shift_range=0.2,
         height_shift_range=0.2,
         shear_range=0.2,
         zoom_range=0.2,
         horizontal_flip=True,
-        vertical_flip=True,
-        fill_mode='reflect',
-        brightness_range=[0.7, 1.3],
-        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
+        fill_mode='nearest'
     )
 
-    # Validation generator with minimal processing
     val_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
-        rescale=1./255,
-        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
+        rescale=1./255
     )
 
     train_generator = train_datagen.flow_from_directory(
@@ -104,7 +103,6 @@ def plot_training_history(history):
     plt.tight_layout()
     plt.savefig('training_history.png')
     plt.close()
-
 def save_metrics(history, test_metrics):
     # Save training history to file
     with open('training_metrics.txt', 'w') as f:
@@ -133,6 +131,18 @@ def train_model(preprocess=False):
     # Configure memory
     configure_memory()
     
+    # Check if processed data already exists
+    if os.path.exists('data/processed') and os.path.exists('data/processed/train') and os.path.exists('data/processed/test'):
+        print("\nProcessed data already exists. Skipping preprocessing...")
+        # Verify data exists in both directories
+        train_files = list(Path('data/processed/train').rglob('*.[Jj][Pp][Gg]'))
+        test_files = list(Path('data/processed/test').rglob('*.[Jj][Pp][Gg]'))
+        if train_files and test_files:
+            print(f"Found {len(train_files)} training images and {len(test_files)} test images")
+            preprocess = False
+        else:
+            print("Existing processed directories are empty. Will preprocess data...")
+    
     # Optional complete preprocessing pipeline
     if preprocess:
         print("Running complete preprocessing pipeline...")
@@ -142,7 +152,7 @@ def train_model(preprocess=False):
         
         # Step 2: Augment
         from utils.augment_mushroom_data import augment_mushroom_data
-        augment_mushroom_data(target_count=5000)
+        augment_mushroom_data(target_count=2000)
         
         # Step 3: Preprocess
         from utils.preprocess_data import preprocess_dataset
@@ -150,7 +160,7 @@ def train_model(preprocess=False):
             data_dir='data/mushroom_data',
             output_dir='data/processed',
             test_size=0.2,
-            img_size=(224, 224)
+            img_size=(160, 160)  # Match reduced size
         )
     else:
         # Verify processed data exists
@@ -176,20 +186,36 @@ def train_model(preprocess=False):
     # Create model
     inputs = tf.keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
     model = create_model(inputs)
-    
-    # Modified optimizer with lower learning rate
-    optimizer = tf.keras.optimizers.Adam(
-        learning_rate=LEARNING_RATE,
-        beta_1=0.9,
-        beta_2=0.999,
-        epsilon=1e-07,
-        clipnorm=1.0
+
+    initial_learning_rate = LEARNING_RATE
+    decay_steps = EPOCHS * steps_per_epoch
+    warmup_steps = 5 * steps_per_epoch
+
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+        initial_learning_rate,
+        decay_steps,
+        t_mul=2.0,
+        m_mul=0.9,
+        alpha=1e-6,
     )
+
+    # Add mixed precision training
+    tf.keras.mixed_precision.set_global_policy('mixed_float16')
     
-    # Compile model with added gradient clipping
+    # Simplified optimizer configuration
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=lr_schedule,
+        beta_1=0.95,
+        beta_2=0.999,
+        epsilon=1e-7,
+        
+    )
+    optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+    
+    # Add model compilation
     model.compile(
         optimizer=optimizer,
-        loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
+        loss=tf.keras.losses.BinaryCrossentropy(from_logits=False, label_smoothing=0.1),
         metrics=[
             'accuracy',
             tf.keras.metrics.AUC(),
@@ -197,35 +223,38 @@ def train_model(preprocess=False):
             tf.keras.metrics.Recall()
         ]
     )
-
-    # Update model training configuration
+    
+    # Updated callbacks
     callbacks = [
+
         tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss',  # Changed back to val_loss
-            patience=10,
+            monitor='val_loss',  # Changed to monitor loss
+            patience=12,
             restore_best_weights=True,
             verbose=1
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',  # Changed back to val_loss
-            factor=0.5,  # Less aggressive reduction
-            patience=5,
-            min_lr=1e-7,
+            monitor='val_loss',  # Changed to monitor loss
+            factor=0.3,  # More aggressive reduction
+            patience=6,
+            min_lr=1e-6,
             verbose=1
         ),
         tf.keras.callbacks.ModelCheckpoint(
             'best_model.keras',
-            monitor='val_accuracy',  # Changed back to val_accuracy
-            save_best_only=True,
+            monitor='val_accuracy',
+            save_best_only=True,  # Fixed parameter name
+            save_weights_only=False,
             mode='max',
             verbose=1
         ),
+        # Add learning rate logger
         tf.keras.callbacks.LambdaCallback(
-            on_epoch_end=lambda epoch, logs: gc.collect()
+            on_epoch_end=lambda epoch, logs: print(f"\nLR: {tf.keras.backend.get_value(optimizer.learning_rate):.2e}")
         )
     ]
 
-    # Train the model with updated parameters
+    # Update fit parameters - remove workers and max_queue_size
     history = model.fit(
         train_generator,
         epochs=EPOCHS,

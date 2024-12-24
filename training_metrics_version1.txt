@@ -1,0 +1,10 @@
+Training History:
+Final training accuracy: 0.6743
+Final validation accuracy: 0.6751
+Final training loss: 0.5857
+Final validation loss: 0.5833
+
+Test Metrics:
+Test loss: 0.5697
+Test accuracy: 0.7256
+Test AUC: 0.7532

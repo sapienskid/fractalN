@@ -13,8 +13,8 @@ def load_and_prep_image(image_path):
     raw_img = tf.io.read_file(image_path)
     # Decode JPEG
     img = tf.io.decode_jpeg(raw_img, channels=3)
-    # Resize
-    img = tf.image.resize(img, [224, 224], method='bilinear')
+    # Resize to 160x160 instead of 224x224
+    img = tf.image.resize(img, [160, 160], method='bilinear')
     # Convert to float32 and normalize
     img = tf.cast(img, tf.float32) / 255.0
     # Add batch dimension
@@ -73,7 +73,7 @@ if __name__ == "__main__":
     if not sys.argv[1].lower().endswith(('.jpg', '.jpeg')):
         print("Warning: Image file should be in JPEG format")
     
-    result, confidence = predict_mushroom('mushroom_classifier.keras', sys.argv[1])
+    result, confidence = predict_mushroom('best_mushroom_model.keras', sys.argv[1])
     confidence_level = analyze_prediction_confidence(confidence)
     print(f"Prediction: {result}")
     print(f"Confidence: {confidence:.2%}")
