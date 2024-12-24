@@ -18,26 +18,30 @@ setup_gpu()
 tf.keras.backend.set_floatx('float32')
 
 # Training parameters
-IMG_HEIGHT = 256         # Reduced image size
-IMG_WIDTH = 256          # Reduced image size
-BATCH_SIZE = 32          # Reduced batch size
+IMG_HEIGHT = 160        # Further reduced
+IMG_WIDTH = 160          # Further reduced
+BATCH_SIZE = 8          # Reduced batch size
 EPOCHS = 50            # Increased epochs
 LEARNING_RATE = 1e-4    # Reduced learning rate
 warmup_epochs = 10      # Increased warmup epochs
 decay_epochs = EPOCHS - warmup_epochs  # Unused now
 
 def configure_memory():
-    """Configure GPU memory settings"""
-    try:
-        if tf.test.is_gpu_available():
-            print("GPU is configured and ready")
-            tf.debugging.set_log_device_placement(True)
-        else:
-            print("Warning: GPU is not available")
-            print("CUDA Path:", os.environ.get('CUDA_HOME'))
-            print("LD_LIBRARY_PATH:", os.environ.get('LD_LIBRARY_PATH'))
-    except Exception as e:
-        print(f"Error in GPU configuration: {e}")
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if physical_devices:
+        try:
+            for device in physical_devices:
+                tf.config.experimental.set_memory_growth(device, True)
+                tf.config.set_logical_device_configuration(
+                    device,
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=4096)]  # Adjust to your GPU
+                )
+            print(f"Memory growth and limit configuration set for GPU.")
+        except RuntimeError as e:
+            print(f"Failed to set memory growth: {e}")
+    else:
+        print("No GPU found. Check your CUDA installation.")
+
 
 def plot_training_history(history):
     """Plot and save training metrics"""
@@ -89,32 +93,44 @@ def create_data_augmentation():
 
 def train_model(preprocess=False):
     """Main training function"""
-    # Clear memory
+    # Clear memory more aggressively
     gc.collect()
     tf.keras.backend.clear_session()
     
-    # Configure memory
-    configure_memory()
+    # Configure memory growth
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if len(physical_devices) > 0:
+        for device in physical_devices:
+            try:
+                tf.config.experimental.set_memory_growth(device, True)
+                print(f"Memory growth enabled for {device}")
+                
+                # Set memory limit to 75% of GPU memory
+                tf.config.set_logical_device_configuration(
+                    device,
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=1024 * 2)]  # 2GB limit
+                )
+            except RuntimeError as e:
+                print(f"Memory growth setting failed: {e}")
     
-    # Initialize data pipeline
+    # Reduce dataset prefetch
     pipeline = DataPipeline(
         img_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=BATCH_SIZE
     )
     
-    # Get datasets
+    # Initialize data pipeline
     datasets = pipeline.setup_data(preprocess=preprocess)
     train_ds = datasets['train']
     val_ds = datasets['validation']
     test_ds = datasets['test']
     
-    # Calculate steps properly
-    num_train_files = sum(len(list((Path('data/processed/train')/c).glob('*.jpg'))) 
-                         for c in ['poisonous', 'edible'])
-    steps_per_epoch = num_train_files // BATCH_SIZE
+    # Get dataset sizes from the pipeline
+    num_train_files = datasets['train_size']
+    num_val_files = datasets['val_size']
     
-    num_val_files = sum(len(list((Path('data/processed/validation')/c).glob('*.jpg'))) 
-                       for c in ['poisonous', 'edible'])
+    # Calculate steps properly
+    steps_per_epoch = num_train_files // BATCH_SIZE
     validation_steps = num_val_files // BATCH_SIZE
     
     # Make sure steps are at least 1
@@ -143,12 +159,18 @@ def train_model(preprocess=False):
         alpha=1e-5
     )
 
+    # Update optimizer to use less memory
     optimizer = tf.keras.optimizers.AdamW(
         learning_rate=lr_schedule,
         weight_decay=1e-5,
         beta_1=0.9,
-        beta_2=0.999
+        beta_2=0.999,
+        epsilon=1e-7,
+        amsgrad=False  # Disable AMS grad to save memory
     )
+
+    # Use mixed precision
+    tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
     # Compile model
     model.compile(
@@ -171,13 +193,14 @@ def train_model(preprocess=False):
             verbose=1,
             min_delta=0.001
         ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_accuracy',  # Changed from val_loss
-            factor=0.5,
-            patience=10,
-            min_lr=1e-6,
-            verbose=1
-        ),
+        # Removed ReduceLROnPlateau callback to avoid LR conflicts:
+        # tf.keras.callbacks.ReduceLROnPlateau(
+        #     monitor='val_accuracy',
+        #     factor=0.5,
+        #     patience=10,
+        #     min_lr=1e-6,
+        #     verbose=1
+        # ),
         tf.keras.callbacks.ModelCheckpoint(
             'best_mushroom_model.keras',
             monitor='val_accuracy',
@@ -191,7 +214,7 @@ def train_model(preprocess=False):
     # Get class weights from datasets
     class_weights = datasets['class_weights']
     
-    # Train model with class weights
+    # Train model with proper steps
     history = model.fit(
         train_ds,
         epochs=EPOCHS,

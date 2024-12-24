@@ -129,29 +129,43 @@ class DataPipeline:
             # Map preprocessing
             ds = ds.map(
                 preprocess_image,
-                num_parallel_calls=tf.data.AUTOTUNE
+                num_parallel_calls=2  # Reduced from AUTOTUNE
             )
 
             # Configure dataset
             ds = ds.cache()
-            if is_training:
-                ds = ds.shuffle(1000, reshuffle_each_iteration=True)
-            ds = ds.batch(self.batch_size)
-            ds = ds.prefetch(tf.data.AUTOTUNE)
             
-            return ds
+            # For training, shuffle before batching
+            if is_training:
+                ds = ds.shuffle(min(500, len(image_paths)))
+                
+            # Batch the dataset
+            ds = ds.batch(self.batch_size)
+            
+            # For training, repeat the dataset AFTER batching
+            if is_training:
+                ds = ds.repeat()
+                
+            ds = ds.prefetch(1)
+            return ds, len(image_paths)  # Return length as well
 
-        # Create datasets
-        datasets['train'] = create_dataset(self.processed_dir / 'train', is_training=True)
-        datasets['validation'] = create_dataset(self.processed_dir / 'validation')
-        datasets['test'] = create_dataset(self.processed_dir / 'test')
+        # Create datasets with their lengths
+        train_ds, train_size = create_dataset(self.processed_dir / 'train', is_training=True)
+        val_ds, val_size = create_dataset(self.processed_dir / 'validation')
+        test_ds, test_size = create_dataset(self.processed_dir / 'test')
+
+        # Store sizes in the datasets dict
+        datasets = {
+            'train': train_ds,
+            'validation': val_ds,
+            'test': test_ds,
+            'train_size': train_size,
+            'val_size': val_size,
+            'test_size': test_size
+        }
 
         # Calculate class weights
         class_weights = self._calculate_class_weights()
-        print("\nClass weights:")
-        print(f"Poisonous (0): {class_weights[0]:.2f}")
-        print(f"Edible (1): {class_weights[1]:.2f}")
-        
         datasets['class_weights'] = class_weights
         
         return datasets

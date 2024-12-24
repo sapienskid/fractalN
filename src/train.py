@@ -187,13 +187,13 @@ def train_model(preprocess=False):
     inputs = tf.keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
     model = create_model(inputs)
 
+    # Modified learning rate schedule
     initial_learning_rate = LEARNING_RATE
     decay_steps = EPOCHS * steps_per_epoch
-    warmup_steps = 5 * steps_per_epoch
 
     lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
         initial_learning_rate,
-        decay_steps,
+        first_decay_steps=decay_steps // 4,  # Adjusted for multiple restarts
         t_mul=2.0,
         m_mul=0.9,
         alpha=1e-6,
@@ -208,11 +208,10 @@ def train_model(preprocess=False):
         beta_1=0.95,
         beta_2=0.999,
         epsilon=1e-7,
-        
     )
     optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
     
-    # Add model compilation
+    # Model compilation remains the same
     model.compile(
         optimizer=optimizer,
         loss=tf.keras.losses.BinaryCrossentropy(from_logits=False, label_smoothing=0.1),
@@ -224,33 +223,25 @@ def train_model(preprocess=False):
         ]
     )
     
-    # Updated callbacks
+    # Updated callbacks - removed ReduceLROnPlateau
     callbacks = [
-
         tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss',  # Changed to monitor loss
+            monitor='val_loss',
             patience=12,
             restore_best_weights=True,
-            verbose=1
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',  # Changed to monitor loss
-            factor=0.3,  # More aggressive reduction
-            patience=6,
-            min_lr=1e-6,
             verbose=1
         ),
         tf.keras.callbacks.ModelCheckpoint(
             'best_model.keras',
             monitor='val_accuracy',
-            save_best_only=True,  # Fixed parameter name
+            save_best_only=True,
             save_weights_only=False,
             mode='max',
             verbose=1
         ),
-        # Add learning rate logger
+        # Modified learning rate logger to work with schedule
         tf.keras.callbacks.LambdaCallback(
-            on_epoch_end=lambda epoch, logs: print(f"\nLR: {tf.keras.backend.get_value(optimizer.learning_rate):.2e}")
+            on_epoch_begin=lambda epoch, logs: print(f"\nCurrent LR: {lr_schedule(optimizer.iterations).numpy():.2e}")
         )
     ]
 
