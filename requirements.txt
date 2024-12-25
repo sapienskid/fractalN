@@ -2,8 +2,6 @@
 numpy>=1.21.0
 tensorflow>=2.12.0
 seaborn
-cupy
-torch
 scikit-learn>=1.0.0
 matplotlib>=3.5.0
 scipy
