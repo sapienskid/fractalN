@@ -1,281 +1,319 @@
 import tensorflow as tf
-import numpy as np
 import os
-from pathlib import Path  # Add this import
+import numpy as np
 import matplotlib.pyplot as plt
-import gc
 from model import create_model
+from utils.muhsroom_processor import MushroomDataProcessor
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.gpu_config import setup_gpu
-tf.keras.backend.set_floatx('float32')  # Ensure we're using FP32
+from pathlib import Path
 
 
-# Configure GPU before importing other dependencies
+# Enable eager execution
+tf.config.run_functions_eagerly(True)
+
+# GPU and memory configuration
 setup_gpu()
-
-# Add CUDA configuration at the top of the file
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use first GPU
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-# Update image parameters
-IMG_HEIGHT = 160  # Reduced from 224
-IMG_WIDTH = 160   # Reduced from 224
-BATCH_SIZE = 8    # Reduced from 32
-EPOCHS = 100     # Increase epochs since we'll use better LR schedule
-LEARNING_RATE = 2e-4  # Fine-tuned learning rate
-warmup_epochs = 5
-decay_epochs = EPOCHS - warmup_epochs
+# Enable mixed precision
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+# Updated hyperparameters
+IMG_HEIGHT = 224
+IMG_WIDTH = 224
+BATCH_SIZE = 16  # Reduced batch size
+EPOCHS = 50
+BASE_LEARNING_RATE = 1e-5
+GRADIENT_ACCUMULATION_STEPS = 2  # Accumulate gradients
+
+
+
+def plot_training_history(history):
+    """Plot and save training metrics"""
+    # Create directory for plots if it doesn't exist
+    os.makedirs('plots', exist_ok=True)
+    
+    # Plot accuracy metrics
+    plt.figure(figsize=(12, 4))
+    
+    # Accuracy subplot
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['accuracy'], label='Training Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    plt.title('Model Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend(loc='lower right')
+    
+    # Loss subplot
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Model Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend(loc='upper right')
+    
+    plt.tight_layout()
+    plt.savefig('plots/training_history.png')
+    plt.close()
+    
+    # Plot additional metrics
+    plt.figure(figsize=(15, 5))
+    
+    # F1 Score
+    plt.subplot(1, 3, 1)
+    plt.plot(history.history['f1_score'], label='Training F1')
+    plt.plot(history.history['val_f1_score'], label='Validation F1')
+    plt.title('Model F1 Score')
+    plt.xlabel('Epoch')
+    plt.ylabel('F1 Score')
+    plt.legend(loc='lower right')
+    
+    # Precision
+    plt.subplot(1, 3, 2)
+    plt.plot(history.history['precision'], label='Training Precision')
+    plt.plot(history.history['val_precision'], label='Validation Precision')
+    plt.title('Model Precision')
+    plt.xlabel('Epoch')
+    plt.ylabel('Precision')
+    plt.legend(loc='lower right')
+    
+    # Recall
+    plt.subplot(1, 3, 3)
+    plt.plot(history.history['recall'], label='Training Recall')
+    plt.plot(history.history['val_recall'], label='Validation Recall')
+    plt.title('Model Recall')
+    plt.xlabel('Epoch')
+    plt.ylabel('Recall')
+    plt.legend(loc='lower right')
+    
+    plt.tight_layout()
+    plt.savefig('plots/additional_metrics.png')
+    plt.close()
+
+def save_metrics(history, test_results, model_name='mushroom_classifier'):
+    """Save training history and test results to file"""
+    os.makedirs('metrics', exist_ok=True)
+    
+    with open(f'metrics/{model_name}_metrics.txt', 'w') as f:
+        # Write training history summary
+        f.write("Training History Summary:\n")
+        f.write("=======================\n\n")
+        
+        # Final epoch metrics
+        final_epoch = len(history.history['accuracy'])
+        f.write(f"Total Epochs Trained: {final_epoch}\n\n")
+        
+        f.write("Final Training Metrics:\n")
+        for metric in history.history.keys():
+            if not metric.startswith('val_'):
+                f.write(f"{metric}: {history.history[metric][-1]:.4f}\n")
+        
+        f.write("\nFinal Validation Metrics:\n")
+        for metric in history.history.keys():
+            if metric.startswith('val_'):
+                f.write(f"{metric}: {history.history[metric][-1]:.4f}\n")
+        
+        # Test results
+        f.write("\nTest Set Results:\n")
+        f.write("================\n\n")
+        for metric_name, value in zip(['loss', 'accuracy', 'auc', 'precision', 'recall', 'f1_score'], test_results):
+            f.write(f"test_{metric_name}: {value:.4f}\n")
+        
+        # Best metrics
+        f.write("\nBest Metrics Achieved:\n")
+        f.write("====================\n\n")
+        for metric in history.history.keys():
+            if metric.startswith('val_'):
+                best_value = max(history.history[metric])
+                best_epoch = history.history[metric].index(best_value) + 1
+                f.write(f"Best {metric}: {best_value:.4f} (Epoch {best_epoch})\n")
+
 
 def configure_memory():
     try:
-        # Use simpler GPU configuration since we handled it in setup_gpu()
-        if tf.test.is_gpu_available():
-            print("GPU is configured and ready")
-            # Print device placement for operations
-            tf.debugging.set_log_device_placement(True)
+        # Memory growth must be set before GPUs are initialized
+        physical_devices = tf.config.list_physical_devices('GPU')
+        if physical_devices:
+            for device in physical_devices:
+                tf.config.experimental.set_memory_growth(device, True)
+                
+            # Limit memory allocation
+            tf.config.set_logical_device_configuration(
+                physical_devices[0],
+                [tf.config.LogicalDeviceConfiguration(memory_limit=1024)]
+            )
         else:
-            print("Warning: GPU is not available")
-            print("CUDA Path:", os.environ.get('CUDA_HOME'))
-            print("LD_LIBRARY_PATH:", os.environ.get('LD_LIBRARY_PATH'))
+            print("Warning: No GPU found")
     except Exception as e:
         print(f"Error in GPU configuration: {e}")
 
+def create_datasets(data_processor, batch_size=BATCH_SIZE):
+    """Create datasets using tf.data pipeline"""
+    
+    # Convert images to float32 and normalize
+    def preprocess(x, y):
+        x = tf.cast(x, tf.float32) / 255.0
+        return x, y
 
+    options = tf.data.Options()
+    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
 
-
-def create_data_generators(img_height=IMG_HEIGHT, img_width=IMG_WIDTH, batch_size=BATCH_SIZE):
-    """Create simple data generators with only rescaling"""
-    # Enhanced data augmentation in generators
-    train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
-        rescale=1./255,
-        rotation_range=30,
-        width_shift_range=0.2,
-        height_shift_range=0.2,
-        shear_range=0.2,
-        zoom_range=0.2,
-        horizontal_flip=True,
-        fill_mode='nearest'
-    )
-
-    val_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
-        rescale=1./255
-    )
-
-    train_generator = train_datagen.flow_from_directory(
-        'data/processed/train',
-        target_size=(img_height, img_width),
+    train_ds = tf.keras.preprocessing.image_dataset_from_directory(
+        data_processor.output_dir / 'train',
+        image_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=batch_size,
-        class_mode='binary',
-        shuffle=True,
+        label_mode='categorical',  # Keep categorical for 2 classes
+        class_names=['edible', 'poisonous'],
+        seed=42,
+        shuffle=True
+    ).map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+    train_ds = train_ds.with_options(options)
+    
+    val_ds = tf.keras.preprocessing.image_dataset_from_directory(
+        data_processor.output_dir / 'val',
+        image_size=(IMG_HEIGHT, IMG_WIDTH),
+        batch_size=batch_size,
+        label_mode='categorical',
+        class_names=['edible', 'poisonous'],
         seed=42
-    )
-
-    validation_generator = val_datagen.flow_from_directory(
-        'data/processed/test',
-        target_size=(img_height, img_width),
+    ).map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+    
+    test_ds = tf.keras.preprocessing.image_dataset_from_directory(
+        data_processor.output_dir / 'test',
+        image_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=batch_size,
-        class_mode='binary',
-        shuffle=False
-    )
-
-    return train_generator, validation_generator
-
-def plot_training_history(history):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+        label_mode='categorical',
+        class_names=['edible', 'poisonous'],
+        seed=42
+    ).map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
     
-    # Plot accuracy
-    ax1.plot(history.history['accuracy'], label='Training Accuracy')
-    ax1.plot(history.history['val_accuracy'], label='Validation Accuracy')
-    ax1.set_title('Model Accuracy')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Accuracy')
-    ax1.legend()
+    # Configure datasets for performance
+    AUTOTUNE = tf.data.AUTOTUNE
+    train_ds = train_ds.cache().prefetch(buffer_size=AUTOTUNE)
+    val_ds = val_ds.cache().prefetch(buffer_size=AUTOTUNE)
+    test_ds = test_ds.cache().prefetch(buffer_size=AUTOTUNE)
     
-    # Plot loss
-    ax2.plot(history.history['loss'], label='Training Loss')
-    ax2.plot(history.history['val_loss'], label='Validation Loss')
-    ax2.set_title('Model Loss')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Loss')
-    ax2.legend()
-    
-    plt.tight_layout()
-    plt.savefig('training_history.png')
-    plt.close()
-def save_metrics(history, test_metrics):
-    # Save training history to file
-    with open('training_metrics.txt', 'w') as f:
-        f.write("Training History:\n")
-        f.write(f"Final training accuracy: {history.history['accuracy'][-1]:.4f}\n")
-        f.write(f"Final validation accuracy: {history.history['val_accuracy'][-1]:.4f}\n")
-        f.write(f"Final training loss: {history.history['loss'][-1]:.4f}\n")
-        f.write(f"Final validation loss: {history.history['val_loss'][-1]:.4f}\n\n")
-        
-        f.write("Test Metrics:\n")
-        f.write(f"Test loss: {test_metrics[0]:.4f}\n")
-        f.write(f"Test accuracy: {test_metrics[1]:.4f}\n")
-        f.write(f"Test AUC: {test_metrics[2]:.4f}\n")
+    return train_ds, val_ds, test_ds
 
 def train_model(preprocess=False):
-    """
-    Train the mushroom classifier model
-    
-    Args:
-        preprocess (bool): Whether to run complete preprocessing pipeline (default: False)
-    """
-    # Clear memory
-    gc.collect()
-    tf.keras.backend.clear_session()
-    
-    # Configure memory
+    """Train the mushroom classifier with the new data pipeline"""
     configure_memory()
     
-    # Check if processed data already exists
-    if os.path.exists('data/processed') and os.path.exists('data/processed/train') and os.path.exists('data/processed/test'):
+    # Initialize data processor
+    data_processor = MushroomDataProcessor()
+    if os.path.exists('data/processed') and os.path.exists('data/processed/train') and os.path.exists('data/processed/test') and os.path.exists('data/processed/val'):
         print("\nProcessed data already exists. Skipping preprocessing...")
         # Verify data exists in both directories
         train_files = list(Path('data/processed/train').rglob('*.[Jj][Pp][Gg]'))
         test_files = list(Path('data/processed/test').rglob('*.[Jj][Pp][Gg]'))
+        val_files = list(Path('data/processed/val').rglob('*.[Jj][Pp][Gg]'))
         if train_files and test_files:
-            print(f"Found {len(train_files)} training images and {len(test_files)} test images")
+            print(f"Found {len(train_files)} training images, {len(val_files)} validation images, {len(test_files)} test images")
             preprocess = False
         else:
             print("Existing processed directories are empty. Will preprocess data...")
     
-    # Optional complete preprocessing pipeline
+    # Run preprocessing if needed
     if preprocess:
-        print("Running complete preprocessing pipeline...")
-        # Step 1: Organize
-        from utils.reorganize_data import reorganize_mushroom_data
-        reorganize_mushroom_data()
-        
-        # Step 2: Augment
-        from utils.augment_mushroom_data import augment_mushroom_data
-        augment_mushroom_data(target_count=2000)
-        
-        # Step 3: Preprocess
-        from utils.preprocess_data import preprocess_dataset
-        preprocess_dataset(
-            data_dir='data/mushroom_data',
-            output_dir='data/processed',
-            test_size=0.2,
-            img_size=(160, 160)  # Match reduced size
-        )
-    else:
-        # Verify processed data exists
-        if not os.path.exists('data/processed'):
-            raise FileNotFoundError(
-                "Processed data not found in data/processed. "
-                "Run with preprocess=True or process data first"
-            )
+        data_processor.create_balanced_dataset(target_count=5000)
+        data_processor.split_dataset()
+        data_processor.verify_dataset()
     
-    # Create data generators
-    train_generator, validation_generator = create_data_generators()
+    # Create datasets
+    train_ds, val_ds, test_ds = create_datasets(data_processor)
     
-    # Calculate correct steps
-    steps_per_epoch = len(train_generator)  # Changed to use len()
-    validation_steps = len(validation_generator)  # Changed to use len()
-
-    print(f"\nTraining configuration:")
-    print(f"Training samples: {train_generator.samples}")
-    print(f"Validation samples: {validation_generator.samples}")
-    print(f"Steps per epoch: {steps_per_epoch}")
-    print(f"Validation steps: {validation_steps}")
-
-    # Create model
+    # Create and compile model
     inputs = tf.keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
     model = create_model(inputs)
-
-    # Modified learning rate schedule
-    initial_learning_rate = LEARNING_RATE
-    decay_steps = EPOCHS * steps_per_epoch
-
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
-        initial_learning_rate,
-        first_decay_steps=decay_steps // 4,  # Adjusted for multiple restarts
-        t_mul=2.0,
-        m_mul=0.9,
-        alpha=1e-6,
-    )
-
-    # Add mixed precision training
-    tf.keras.mixed_precision.set_global_policy('mixed_float16')
     
-    # Simplified optimizer configuration
+    # Add cosine decay learning rate schedule
+    initial_learning_rate = BASE_LEARNING_RATE
+    # decay_steps = EPOCHS * len(train_ds)
+    # lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+    #     initial_learning_rate,
+    #     decay_steps,
+    #     alpha=1e-6
+    # )
+    
+    # Update optimizer with schedule
     optimizer = tf.keras.optimizers.Adam(
-        learning_rate=lr_schedule,
-        beta_1=0.95,
-        beta_2=0.999,
-        epsilon=1e-7,
+        learning_rate=BASE_LEARNING_RATE,
+        global_clipnorm=1.0
     )
-    optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
-    
-    # Model compilation remains the same
+        
+    # Compile model
     model.compile(
         optimizer=optimizer,
-        loss=tf.keras.losses.BinaryCrossentropy(from_logits=False, label_smoothing=0.1),
+        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False),
         metrics=[
             'accuracy',
-            tf.keras.metrics.AUC(),
-            tf.keras.metrics.Precision(),
-            tf.keras.metrics.Recall()
+            tf.keras.metrics.AUC(name='auc', num_thresholds=200),
+            tf.keras.metrics.Precision(name='precision'),
+            tf.keras.metrics.Recall(name='recall'),
+            tf.keras.metrics.F1Score(name='f1_score', average='macro', threshold=None)  # Changed parameters
         ]
     )
     
-    # Updated callbacks - removed ReduceLROnPlateau
+    # Enhanced callbacks
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=12,
+            monitor='val_f1_score',
+            mode='max',
+            patience=15,
             restore_best_weights=True,
             verbose=1
         ),
         tf.keras.callbacks.ModelCheckpoint(
             'best_model.keras',
-            monitor='val_accuracy',
-            save_best_only=True,
-            save_weights_only=False,
+            monitor='val_f1_score',
             mode='max',
+            save_best_only=True,
             verbose=1
         ),
-        # Modified learning rate logger to work with schedule
-        tf.keras.callbacks.LambdaCallback(
-            on_epoch_begin=lambda epoch, logs: print(f"\nCurrent LR: {lr_schedule(optimizer.iterations).numpy():.2e}")
-        )
+        tf.keras.callbacks.TensorBoard(
+            log_dir='./logs',
+            update_freq='epoch'
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            patience=5,
+            min_lr=1e-7,
+            verbose=1
+        ),
+        
+        
+        # Add CSV logger
+        tf.keras.callbacks.CSVLogger('training_log.csv')
     ]
-
-    # Update fit parameters - remove workers and max_queue_size
+    
+    # Train model
     history = model.fit(
-        train_generator,
+        train_ds,
+        validation_data=val_ds,
         epochs=EPOCHS,
-        steps_per_epoch=steps_per_epoch,
-        validation_data=validation_generator,
-        validation_steps=validation_steps,
         callbacks=callbacks,
         verbose=1,
-        shuffle=True
     )
-
-    # Reset generators before evaluation
-    validation_generator.reset()
     
-    # Evaluate model
-    val_metrics = model.evaluate(
-        validation_generator,
-        steps=validation_steps
-    )
-
-    print(f"\nValidation loss: {val_metrics[0]:.4f}")
-    print(f"Validation accuracy: {val_metrics[1]:.4f}")
-    print(f"Validation AUC: {val_metrics[2]:.4f}")
-
-    # Plot and save training history
+    # Evaluate on test set
+    print("\nEvaluating on test set:")
+    test_results = model.evaluate(test_ds, verbose=1)
+    
+    # Plot and save metrics
     plot_training_history(history)
-    save_metrics(history, val_metrics)
-
-    # Save the final model
-    model.save('mushroom_classifier.keras')  # Changed from .h5 to .keras
+    save_metrics(history, test_results)
+    
+    # Print final results
+    print("\nTest Results:")
+    for metric_name, value in zip(model.metrics_names, test_results):
+        print(f"{metric_name}: {value:.4f}")
+    
+    return model, history
 
 if __name__ == "__main__":
-    train_model(preprocess=True)
+    model, history = train_model(preprocess=True)

@@ -12,3 +12,6 @@ psutil
 GPUtil
 colorama
 Pillow>=9.0.0
+albumentations
+requests
+beautifulsoup4
