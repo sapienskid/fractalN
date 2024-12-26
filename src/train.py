@@ -2,8 +2,8 @@ import tensorflow as tf
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from model import create_model
-from utils.muhsroom_processor import MushroomDataProcessor
+from src.model import create_model  # Update import path
+from src.utils.muhsroom_processor import MushroomDataProcessor
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.gpu_config import setup_gpu
@@ -23,8 +23,8 @@ os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
 # Updated hyperparameters
-IMG_HEIGHT = 224
-IMG_WIDTH = 224
+IMG_HEIGHT = 299
+IMG_WIDTH = 299
 BATCH_SIZE = 8
 EPOCHS = 150
 BASE_LEARNING_RATE = 1e-5
@@ -138,7 +138,7 @@ def save_metrics(history, test_results, model_name='mushroom_classifier'):
 def configure_memory():
     try:
         physical_devices = tf.config.list_physical_devices('GPU')
-        if physical_devices:
+        if (physical_devices):
             for device in physical_devices:
                 tf.config.experimental.set_memory_growth(device, True)
                 
@@ -156,8 +156,39 @@ def configure_memory():
     except Exception as e:
         print(f"Error in GPU configuration: {e}")
 
+def verify_data_exists():
+    """Verify data exists and return paths"""
+    base_dir = Path('data/processed')
+    if not base_dir.exists():
+        raise ValueError("Processed data directory not found!")
+        
+    train_dir = base_dir / 'train'
+    if not train_dir.exists():
+        raise ValueError("Training data directory not found!")
+        
+    counts = {
+        'edible': len(list((train_dir / 'edible').glob('*.[Jj][Pp][Gg]'))),
+        'poisonous': len(list((train_dir / 'poisonous').glob('*.[Jj][Pp][Gg]')))
+    }
+    
+    if sum(counts.values()) == 0:
+        raise ValueError("No training images found! Run with preprocess=True first.")
+        
+    print(f"Found {counts['edible']} edible and {counts['poisonous']} poisonous training images")
+    return True
+
 def create_datasets(data_processor, batch_size=BATCH_SIZE):
-    """Create datasets using TensorFlow's built-in functionality with memory optimizations"""
+    """Create datasets with data verification"""
+    try:
+        verify_data_exists()
+    except ValueError as e:
+        print(f"Data verification failed: {e}")
+        print("Running preprocessing to create required data...")
+        data_processor.split_dataset()
+        data_processor.verify_dataset()
+        
+        # Verify again after preprocessing
+        verify_data_exists()
     
     # Basic normalization preprocessing
     def preprocess(x, y):
@@ -166,10 +197,12 @@ def create_datasets(data_processor, batch_size=BATCH_SIZE):
     # Data augmentation layer for training
     data_augmentation = tf.keras.Sequential([
         tf.keras.layers.RandomFlip("horizontal_and_vertical"),
-        tf.keras.layers.RandomRotation(0.2),
+        tf.keras.layers.RandomRotation(0.3),
         tf.keras.layers.RandomZoom(0.2),
+        tf.keras.layers.RandomTranslation(0.1, 0.1),
         tf.keras.layers.RandomBrightness(0.2),
         tf.keras.layers.RandomContrast(0.2),
+        tf.keras.layers.GaussianNoise(0.1)
     ])
     
     # Add memory-efficient options
@@ -242,103 +275,118 @@ def create_datasets(data_processor, batch_size=BATCH_SIZE):
 
 
 def train_model(preprocess=False):
-    """Train the mushroom classifier"""
-    
-    # Initialize data processor
-    data_processor = MushroomDataProcessor()
-    if os.path.exists('data/processed') and os.path.exists('data/processed/train') and os.path.exists('data/processed/test') and os.path.exists('data/processed/val'):
-        print("\nProcessed data already exists. Skipping preprocessing...")
-        train_files = list(Path('data/processed/train').rglob('*.[Jj][Pp][Gg]'))
-        test_files = list(Path('data/processed/test').rglob('*.[Jj][Pp][Gg]'))
-        val_files = list(Path('data/processed/val').rglob('*.[Jj][Pp][Gg]'))
-        if train_files and test_files:
-            print(f"Found {len(train_files)} training images, {len(val_files)} validation images, {len(test_files)} test images")
-            preprocess = False
-        else:
-            print("Existing processed directories are empty. Will preprocess data...")
-    
-    if preprocess:
-        data_processor.create_balanced_dataset(target_count=5000)
-        data_processor.split_dataset()
-        data_processor.verify_dataset()
-    
-    # Create datasets
-    train_ds, val_ds, test_ds, class_weights, steps_per_epoch = create_datasets(data_processor)
-    
-    # Create and compile model
-    inputs = tf.keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
-    model = create_model(inputs)
-    
-    # Compile model
-    optimizer = tf.keras.optimizers.Adam(
-        learning_rate=BASE_LEARNING_RATE,
-        global_clipnorm=1.0
-    )
-    
-    model.compile(
-        optimizer=optimizer,
-        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False),
-        metrics=[
-            'accuracy',
-            tf.keras.metrics.AUC(name='auc', num_thresholds=200),
-            tf.keras.metrics.Precision(name='precision'),
-            tf.keras.metrics.Recall(name='recall'),
-            tf.keras.metrics.F1Score(name='f1_score', average='macro', threshold=None)
+    """Train the mushroom classifier with improved error handling"""
+    try:
+        # Initialize data processor
+        data_processor = MushroomDataProcessor()
+        
+        # Force preprocessing if data doesn't exist
+        if not Path('data/processed/train').exists() or preprocess:
+            print("Starting data preprocessing...")
+            data_processor.split_dataset()
+            data_processor.verify_dataset()
+        
+        # Create datasets with automatic preprocessing if needed
+        train_ds, val_ds, test_ds, class_weights, steps_per_epoch = create_datasets(data_processor)
+        
+        # Create and compile model
+        inputs = tf.keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
+        model = create_model(inputs)
+        
+        # Create the learning rate schedule
+        lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+            initial_learning_rate=1e-4,
+            first_decay_steps=1000,
+            alpha=1e-6
+        )
+        
+        # Use the schedule in optimizer
+        optimizer = tf.keras.optimizers.AdamW(
+            learning_rate=lr_schedule,  # Use the scheduler here
+            weight_decay=1e-5,
+            global_clipnorm=1.0
+        )
+        
+            # Add LR monitoring callback
+        class LRLogger(tf.keras.callbacks.Callback):
+            def on_epoch_end(self, epoch, logs=None):
+                lr = self.model.optimizer.learning_rate
+                if hasattr(lr, 'value'):
+                    lr = lr.value()
+                print(f'\nLearning rate for epoch {epoch+1} was {lr:.2e}')
+        
+        
+        model.compile(
+            optimizer=optimizer,
+            loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False),
+            metrics=[
+                'accuracy',
+                tf.keras.metrics.AUC(name='auc', num_thresholds=200),
+                tf.keras.metrics.Precision(name='precision'),
+                tf.keras.metrics.Recall(name='recall'),
+                tf.keras.metrics.F1Score(name='f1_score', average='macro', threshold=None)
+            ]
+        )
+        
+        # Update callbacks list
+        callbacks = [
+            LRLogger(),  # Add LR logging
+            tf.keras.callbacks.TensorBoard(
+                log_dir='./logs',
+                update_freq='epoch',
+                profile_batch=0  # Disable profiling for memory efficiency
+            ),
+            tf.keras.callbacks.ModelCheckpoint(
+                'best_mushroom_model.keras',
+                monitor='val_f1_score',
+                mode='max',
+                save_best_only=True,
+                verbose=1
+            ),
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_f1_score',
+                mode='max',
+                patience=15,
+                restore_best_weights=True,
+                verbose=1
+            ),
         ]
-    )
-    
-    # Fix callbacks configuration
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor='val_f1_score',
-            mode='max',
-            patience=15,
-            restore_best_weights=True,
-            verbose=1
-        ),
-        tf.keras.callbacks.ModelCheckpoint(
-            'best_mushroom_model.keras',
-            monitor='val_f1_score',
-            mode='max',
-            save_best_only=True,  # Fixed from save_best_weights
-            verbose=1
-        ),
-        tf.keras.callbacks.TensorBoard(
-            log_dir='./logs',
-            update_freq='epoch'
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            patience=5,
-            min_lr=1e-7,
-            verbose=1
-        ),
-        tf.keras.callbacks.CSVLogger('training_log.csv')
-    ]
-    
-    # Train model
-    history = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=EPOCHS,
-        callbacks=callbacks,
-        verbose=1,
-        class_weight=class_weights,
-        steps_per_epoch=steps_per_epoch
-    )
-    
-    # Evaluate and save results
-    print("\nEvaluating on test set:")
-    test_results = model.evaluate(test_ds, verbose=1)
-    
-    plot_training_history(history)
-    save_metrics(history, test_results)
-    
-    print("\nTest Results:")
-    for metric_name, value in zip(model.metrics_names, test_results):
-        print(f"{metric_name}: {value:.4f}")
-    
-    return model, history
+        # Verify class weights before training
+        print("\nClass weights being used:")
+        for class_idx, weight in class_weights.items():
+            print(f"Class {class_idx}: {weight:.4f}")
+        
+        # Training
+        history = model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=EPOCHS,
+            callbacks=callbacks,
+            verbose=1,
+            class_weight=class_weights,
+            steps_per_epoch=steps_per_epoch
+        )
+        
+        # Evaluate and save results
+        print("\nEvaluating on test set:")
+        test_results = model.evaluate(test_ds, verbose=1)
+        
+        plot_training_history(history)
+        save_metrics(history, test_results)
+        
+        print("\nTest Results:")
+        for metric_name, value in zip(model.metrics_names, test_results):
+            print(f"{metric_name}: {value:.4f}")
+        
+        return model, history
+
+    except Exception as e:
+        print(f"Error during training: {e}")
+        print("\nPlease ensure you have:")
+        print("1. Uploaded your data correctly")
+        print("2. Run with preprocess=True for first time setup")
+        print("3. Have the correct directory structure")
+        raise
 
 if __name__ == "__main__":
     model, history = train_model(preprocess=False)
