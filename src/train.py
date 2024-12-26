@@ -33,8 +33,9 @@ GRADIENT_ACCUMULATION_STEPS = 2  # Accumulate gradients
 
 def plot_training_history(history):
     """Plot and save training metrics"""
-    # Create directory for plots if it doesn't exist
-    os.makedirs('plots', exist_ok=True)
+    # Save plots in results/plots directory
+    plots_dir = os.path.join('results', 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
     
     # Plot accuracy metrics
     plt.figure(figsize=(12, 4))
@@ -58,7 +59,7 @@ def plot_training_history(history):
     plt.legend(loc='upper right')
     
     plt.tight_layout()
-    plt.savefig('plots/training_history.png')
+    plt.savefig(os.path.join(plots_dir, 'training_history.png'))
     plt.close()
     
     # Plot additional metrics
@@ -92,14 +93,16 @@ def plot_training_history(history):
     plt.legend(loc='lower right')
     
     plt.tight_layout()
-    plt.savefig('plots/additional_metrics.png')
+    plt.savefig(os.path.join(plots_dir, 'additional_metrics.png'))
     plt.close()
 
 def save_metrics(history, test_results, model_name='mushroom_classifier'):
     """Save training history and test results to file"""
-    os.makedirs('metrics', exist_ok=True)
+    # Save metrics in results/metrics directory
+    metrics_dir = os.path.join('results', 'metrics')
+    os.makedirs(metrics_dir, exist_ok=True)
     
-    with open(f'metrics/{model_name}_metrics.txt', 'w') as f:
+    with open(os.path.join(metrics_dir, f'{model_name}_metrics.txt'), 'w') as f:
         # Write training history summary
         f.write("Training History Summary:\n")
         f.write("=======================\n\n")
@@ -159,6 +162,11 @@ def configure_memory():
 def verify_data_exists():
     """Verify data exists and return paths"""
     base_dir = Path('data/processed')
+    
+    # Handle symlink for Colab
+    if os.path.islink(base_dir):
+        base_dir = Path(os.readlink(base_dir))
+    
     if not base_dir.exists():
         raise ValueError("Processed data directory not found!")
         
@@ -221,9 +229,19 @@ def create_datasets(data_processor, batch_size=BATCH_SIZE):
     # Calculate steps per epoch
     steps_per_epoch = 20000 // BATCH_SIZE
 
+    # Update paths to handle symlinks
+    train_path = Path(data_processor.output_dir) / 'train'
+    val_path = Path(data_processor.output_dir) / 'val'
+    test_path = Path(data_processor.output_dir) / 'test'
+    
+    if os.path.islink(train_path):
+        train_path = Path(os.readlink(train_path))
+        val_path = Path(os.readlink(val_path))
+        test_path = Path(os.readlink(test_path))
+
     # Create training dataset with optimizations
     train_ds = tf.keras.preprocessing.image_dataset_from_directory(
-        data_processor.output_dir / 'train',
+        train_path,
         image_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=batch_size,
         label_mode='categorical',
@@ -244,7 +262,7 @@ def create_datasets(data_processor, batch_size=BATCH_SIZE):
     
     # Create validation dataset with optimizations
     val_ds = tf.keras.preprocessing.image_dataset_from_directory(
-        data_processor.output_dir / 'val',
+        val_path,
         image_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=batch_size,
         label_mode='categorical',
@@ -258,7 +276,7 @@ def create_datasets(data_processor, batch_size=BATCH_SIZE):
     
     # Create test dataset with optimizations
     test_ds = tf.keras.preprocessing.image_dataset_from_directory(
-        data_processor.output_dir / 'test',
+        test_path,
         image_size=(IMG_HEIGHT, IMG_WIDTH),
         batch_size=batch_size,
         label_mode='categorical',
@@ -281,7 +299,11 @@ def train_model(preprocess=False):
         data_processor = MushroomDataProcessor()
         
         # Force preprocessing if data doesn't exist
-        if not Path('data/processed/train').exists() or preprocess:
+        processed_dir = Path('data/processed/train')
+        if os.path.islink(processed_dir):
+            processed_dir = Path(os.readlink(processed_dir))
+            
+        if not processed_dir.exists() or preprocess:
             print("Starting data preprocessing...")
             data_processor.split_dataset()
             data_processor.verify_dataset()
@@ -328,16 +350,16 @@ def train_model(preprocess=False):
             ]
         )
         
-        # Update callbacks list
+        # Update callbacks list with new directories
         callbacks = [
-            LRLogger(),  # Add LR logging
+            LRLogger(),
             tf.keras.callbacks.TensorBoard(
-                log_dir='./logs',
+                log_dir=os.path.join('results', 'logs'),
                 update_freq='epoch',
-                profile_batch=0  # Disable profiling for memory efficiency
+                profile_batch=0
             ),
             tf.keras.callbacks.ModelCheckpoint(
-                'best_mushroom_model.keras',
+                os.path.join('models', 'best_mushroom_model.keras'),
                 monitor='val_f1_score',
                 mode='max',
                 save_best_only=True,
@@ -367,16 +389,27 @@ def train_model(preprocess=False):
             steps_per_epoch=steps_per_epoch
         )
         
-        # Evaluate and save results
+        # Evaluate model on test set
         print("\nEvaluating on test set:")
         test_results = model.evaluate(test_ds, verbose=1)
         
+        # After training, save final model to models directory
+        os.makedirs('models', exist_ok=True)
+        model.save(os.path.join('models', 'mushroom_classifier.keras'))
+        
+        # Save results
         plot_training_history(history)
         save_metrics(history, test_results)
         
         print("\nTest Results:")
         for metric_name, value in zip(model.metrics_names, test_results):
             print(f"{metric_name}: {value:.4f}")
+            
+        print("\nModel and results saved in:")
+        print("- Models: ./models/")
+        print("- Plots: ./results/plots/")
+        print("- Metrics: ./results/metrics/")
+        print("- Logs: ./results/logs/")
         
         return model, history
 
@@ -389,4 +422,10 @@ def train_model(preprocess=False):
         raise
 
 if __name__ == "__main__":
+    # Create necessary directories
+    os.makedirs('models', exist_ok=True)
+    os.makedirs(os.path.join('results', 'plots'), exist_ok=True)
+    os.makedirs(os.path.join('results', 'metrics'), exist_ok=True)
+    os.makedirs(os.path.join('results', 'logs'), exist_ok=True)
+    
     model, history = train_model(preprocess=False)
