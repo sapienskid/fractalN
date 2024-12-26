@@ -8,13 +8,17 @@ from gpu_config import setup_gpu
 # Configure GPU at startup
 setup_gpu()
 
+# Add constants for image dimensions
+IMG_HEIGHT = 224
+IMG_WIDTH = 224
+
 def load_and_prep_image(image_path):
     # Read JPEG file
     raw_img = tf.io.read_file(image_path)
     # Decode JPEG
     img = tf.io.decode_jpeg(raw_img, channels=3)
-    # Resize to 160x160 instead of 224x224
-    img = tf.image.resize(img, [160, 160], method='bilinear')
+    # Resize to match model's expected input
+    img = tf.image.resize(img, [IMG_HEIGHT, IMG_WIDTH], method='bilinear')
     # Convert to float32 and normalize
     img = tf.cast(img, tf.float32) / 255.0
     # Add batch dimension
@@ -25,29 +29,27 @@ def predict_mushroom(model_path, image_path):
     try:
         # Ensure we're using the GPU
         with tf.device('/GPU:0'):
-            # Load model with compile=False to avoid optimizer state loading
-            model = tf.keras.models.load_model(model_path.replace('.h5', '.keras'), compile=False)
+            model = tf.keras.models.load_model(model_path, compile=False)
             
-            # Recompile model with basic settings
-            model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+            model.compile(
+                optimizer='adam', 
+                loss='categorical_crossentropy',
+                metrics=['accuracy']
+            )
             
-            # Prepare the image
             processed_image = load_and_prep_image(image_path)
-            
-            # Make prediction
             prediction = model.predict(processed_image, verbose=0)
             
-            # Extract the scalar prediction value
-            pred_value = float(prediction[0])
+            # Get probabilities for each class
+            edible_prob = float(prediction[0][0])
+            poisonous_prob = float(prediction[0][1])
             
-            # Use standard threshold
-            THRESHOLD = 0.5
-            
-            # Return prediction and raw confidence value
-            if pred_value > THRESHOLD:
-                return "Poisonous", pred_value
+            # Return prediction based on highest probability
+            if poisonous_prob > edible_prob:
+                return "Poisonous", poisonous_prob
             else:
-                return "Edible", 1 - pred_value
+                return "Edible", edible_prob
+            
     except Exception as e:
         print(f"Error making prediction: {e}")
         raise
@@ -73,7 +75,9 @@ if __name__ == "__main__":
     if not sys.argv[1].lower().endswith(('.jpg', '.jpeg')):
         print("Warning: Image file should be in JPEG format")
     
-    result, confidence = predict_mushroom('best_mushroom_model.keras', sys.argv[1])
+    # Change model path to match what train.py saves
+    result, confidence = predict_mushroom('best_model.keras', sys.argv[1])
+    
     confidence_level = analyze_prediction_confidence(confidence)
     print(f"Prediction: {result}")
     print(f"Confidence: {confidence:.2%}")

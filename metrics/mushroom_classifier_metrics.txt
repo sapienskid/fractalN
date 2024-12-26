@@ -1,41 +1,41 @@
 Training History Summary:
 =======================
 
-Total Epochs Trained: 27
+Total Epochs Trained: 34
 
 Final Training Metrics:
-accuracy: 0.5851
-auc: 0.6144
-f1_score: 0.5852
-loss: 0.7071
-precision: 0.5852
-recall: 0.5842
+accuracy: 0.5784
+auc: 0.6123
+f1_score: 0.5778
+loss: 0.6998
+precision: 0.5786
+recall: 0.5777
 learning_rate: 0.0000
 
 Final Validation Metrics:
-val_accuracy: 0.5298
-val_auc: 0.5539
-val_f1_score: 0.5039
-val_loss: 0.6994
-val_precision: 0.5306
-val_recall: 0.5298
+val_accuracy: 0.5851
+val_auc: 0.6219
+val_f1_score: 0.5771
+val_loss: 0.6712
+val_precision: 0.5851
+val_recall: 0.5851
 
 Test Set Results:
 ================
 
-test_loss: 0.6799
-test_accuracy: 0.5793
-test_auc: 0.5992
-test_precision: 0.5789
-test_recall: 0.5773
-test_f1_score: 0.5787
+test_loss: 0.6701
+test_accuracy: 0.6166
+test_auc: 0.6406
+test_precision: 0.6166
+test_recall: 0.6166
+test_f1_score: 0.6128
 
 Best Metrics Achieved:
 ====================
 
-Best val_accuracy: 0.5517 (Epoch 12)
-Best val_auc: 0.5608 (Epoch 12)
-Best val_f1_score: 0.5504 (Epoch 12)
-Best val_loss: 0.7424 (Epoch 1)
-Best val_precision: 0.5507 (Epoch 12)
-Best val_recall: 0.5486 (Epoch 12)
+Best val_accuracy: 0.6029 (Epoch 15)
+Best val_auc: 0.6284 (Epoch 18)
+Best val_f1_score: 0.5869 (Epoch 19)
+Best val_loss: 0.7104 (Epoch 1)
+Best val_precision: 0.6039 (Epoch 15)
+Best val_recall: 0.6029 (Epoch 15)
